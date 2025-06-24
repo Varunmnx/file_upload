@@ -6,9 +6,9 @@
   ],
   "compilerOptions": {
     "moduleResolution": "Node",
-    "baseUrl": "./",
+    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     }
   }
 }

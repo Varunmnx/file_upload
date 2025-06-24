@@ -16,6 +16,7 @@ import { diskStorage } from 'multer';
           cb && cb(null, filename);
         },
       }),
+      limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
     }),
   ],
   providers: [FileUploadService],

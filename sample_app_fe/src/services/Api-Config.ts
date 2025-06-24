@@ -23,5 +23,5 @@ export const DEFAULT_API_CONFIG: ApiConfig = {
   baseURL: Config.API_URL,
 
   // Set the default timeout for requests (e.g., 600 seconds).
-  timeout: 600000,
+  timeout: 1000 * 60 * 60 * 1000,
 };

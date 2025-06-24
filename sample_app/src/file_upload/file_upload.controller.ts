@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
+/* eslint-disable prettier/prettier */
 import {
   Controller,
   Post,
@@ -9,7 +11,8 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
-import { extname } from 'path';
+import * as multer from 'multer';
+import path, { extname } from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 
@@ -269,18 +272,282 @@ export class FileUploadController {
     };
   }
 
-  // 5. CHUNKED UPLOAD - Upload Chunk
+  // 5. CHUNKED UPLOAD - APPROACH 1: Using Temp Directory (RECOMMENDED)
   @Post('chunk/upload')
   @UseInterceptors(
     FileInterceptor('chunk', {
       storage: diskStorage({
         destination: (req, file, cb) => {
-          const fileId = (req.body as ChunkUploadDto).fileId;
-          const dest = `./uploads/chunks/${fileId}`;
+          // Since req.body isn't available yet, we'll use a temp directory
+          // and move the file later in the handler
+          const tempDir = './uploads/temp';
+          if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+          }
+          cb(null, tempDir);
+        },
+        filename: (req, file, cb) => {
+          // Generate a temporary unique filename
+          const tempName = `temp-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+          cb(null, tempName);
+        },
+      }),
+      limits: {
+        fileSize: 5 * 1024 * 1024 * 4, // 5MB per chunk
+      },
+    }),
+  )
+  async uploadChunk(@UploadedFile() chunk: Express.Multer.File, @Body() chunkDto: ChunkUploadDto) {
+    if (!chunk) {
+      throw new BadRequestException('No chunk uploaded');
+    }
+  console.log("Started")
+    // Validate input
+    if (!chunkDto.fileId || isNaN(chunkDto.chunkIndex) || isNaN(chunkDto.totalChunks)) {
+      // Clean up temp file
+      fs.unlinkSync(chunk.path);
+      throw new BadRequestException('Invalid upload parameters');
+    }
+
+    const uploadDir = path.join('uploads', 'chunks', chunkDto.fileId);
+    const metadataPath = path.join(uploadDir, 'metadata.json');
+
+    if (!fs.existsSync(metadataPath)) {
+      // Clean up temp file
+      fs.unlinkSync(chunk.path);
+      throw new BadRequestException('Upload session not found');
+    }
+
+    // Ensure upload directory exists
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+
+    // Move file from temp to correct location
+    const finalChunkPath = path.join(uploadDir, `chunk-${chunkDto.chunkIndex}`);
+    fs.renameSync(chunk.path, finalChunkPath);
+
+    // Update chunk path for further processing
+    chunk.path = finalChunkPath;
+
+    // Read and validate metadata
+    let metadata: UploadMetadata;
+    try {
+      metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    } catch (err) {
+      console.log(err)
+
+      // Clean up chunk file
+      fs.unlinkSync(finalChunkPath);
+      throw new BadRequestException('Invalid metadata file');
+    }
+
+    // Check if chunk already exists
+    const existingChunk = metadata.uploadedChunks.find((c) => c.index === chunkDto.chunkIndex);
+    if (existingChunk) {
+      // Remove the duplicate chunk file
+      fs.unlinkSync(finalChunkPath);
+      return {
+        message: `Chunk ${chunkDto.chunkIndex + 1}/${metadata.totalChunks} already uploaded`,
+        fileId: chunkDto.fileId,
+        progress: (metadata.uploadedChunks.length / metadata.totalChunks) * 100,
+        remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
+      };
+    }
+
+    // Update metadata
+    metadata.uploadedChunks.push({
+      index: chunkDto.chunkIndex,
+      size: chunk.size,
+      uploadedAt: new Date().toISOString(),
+    });
+
+    try {
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+    } catch (err) {
+      console.log(err)
+      throw new BadRequestException('Failed to update metadata');
+    }
+
+    const isComplete = metadata.uploadedChunks.length === metadata.totalChunks;
+
+    if (isComplete) {
+      try {
+        // Merge chunks
+        const finalFilePath = await this.mergeChunks(chunkDto.fileId, metadata);
+        metadata.status = 'completed';
+        metadata.finalPath = finalFilePath;
+        fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+
+        return {
+          message: 'File upload completed',
+          fileId: chunkDto.fileId,
+          finalPath: finalFilePath,
+          totalSize: metadata.fileSize,
+        };
+      } catch (err) {
+        console.log(err)
+        throw new BadRequestException('Failed to merge chunks');
+      }
+    }
+
+    return {
+      message: `Chunk ${chunkDto.chunkIndex + 1}/${metadata.totalChunks} uploaded`,
+      fileId: chunkDto.fileId,
+      progress: (metadata.uploadedChunks.length / metadata.totalChunks) * 100,
+      remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
+    };
+  }
+
+  // 6. CHUNKED UPLOAD - APPROACH 2: Using Memory Storage
+// 6. CHUNKED UPLOAD - APPROACH 2: Using Memory Storage
+  @Post('chunk/upload-memory')
+  @UseInterceptors(
+    FileInterceptor('chunk', {
+      storage: multer.memoryStorage(), // Store in memory first
+      limits: {
+        fileSize: 5 * 1024 * 1024, // 5MB per chunk
+      },
+    }),
+  )
+  async uploadChunkMemory(@UploadedFile() chunk: Express.Multer.File, @Body() chunkDto: ChunkUploadDto) {
+    if (!chunk) {
+      throw new BadRequestException('No chunk uploaded');
+    }
+
+    // Validate input
+    if (!chunkDto.fileId || isNaN(chunkDto.chunkIndex) || isNaN(chunkDto.totalChunks)) {
+      throw new BadRequestException('Invalid upload parameters');
+    }
+
+    const uploadDir = path.join('uploads', 'chunks', chunkDto.fileId);
+    const metadataPath = path.join(uploadDir, 'metadata.json');
+
+    if (!fs.existsSync(metadataPath)) {
+      throw new BadRequestException('Upload session not found');
+    }
+
+    // Ensure upload directory exists
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+
+    // Write chunk to disk from memory buffer
+    const chunkPath = path.join(uploadDir, `chunk-${chunkDto.chunkIndex}`);
+    
+    try {
+      // Check if chunk.buffer exists
+      if (!chunk.buffer) {
+        throw new BadRequestException('Chunk buffer is empty');
+      }
+      fs.writeFileSync(chunkPath, chunk.buffer);
+    } catch (err) {
+      console.error('Error writing chunk to disk:', err);
+      throw new BadRequestException('Failed to write chunk to disk');
+    }
+
+    // Read and validate metadata
+    let metadata: UploadMetadata;
+    try {
+      const metadataContent = fs.readFileSync(metadataPath, 'utf8');
+      metadata = JSON.parse(metadataContent);
+      
+      // Validate metadata structure
+      if (!metadata.uploadedChunks || !Array.isArray(metadata.uploadedChunks)) {
+        throw new Error('Invalid metadata structure: uploadedChunks is not an array');
+      }
+    } catch (err) {
+      console.error('Error reading/parsing metadata:', err);
+      // Clean up chunk file
+      if (fs.existsSync(chunkPath)) {
+        fs.unlinkSync(chunkPath);
+      }
+      throw new BadRequestException('Invalid metadata file');
+    }
+
+    // Check if chunk already exists
+    const existingChunk = metadata.uploadedChunks.find((c) => c.index === chunkDto.chunkIndex);
+    if (existingChunk) {
+      fs.unlinkSync(chunkPath);
+      return {
+        message: `Chunk ${chunkDto.chunkIndex + 1}/${metadata.totalChunks} already uploaded`,
+        fileId: chunkDto.fileId,
+        progress: (metadata.uploadedChunks.length / metadata.totalChunks) * 100,
+        remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
+      };
+    }
+
+    // Update metadata
+    metadata.uploadedChunks.push({
+      index: chunkDto.chunkIndex,
+      size: chunk.size,
+      uploadedAt: new Date().toISOString(),
+    });
+
+    try {
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+    } catch (err) {
+      console.error('Error updating metadata:', err);
+      // Clean up chunk file
+      if (fs.existsSync(chunkPath)) {
+        fs.unlinkSync(chunkPath);
+      }
+      throw new BadRequestException('Failed to update metadata');
+    }
+
+    const isComplete = metadata.uploadedChunks.length === metadata.totalChunks;
+
+    if (isComplete) {
+      try {
+        console.log('All chunks uploaded, starting merge process...');
+        console.log('Metadata:', JSON.stringify(metadata, null, 2));
+        
+        const finalFilePath = await this.mergeChunks(chunkDto.fileId, metadata);
+        metadata.status = 'completed';
+        metadata.finalPath = finalFilePath;
+        fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+
+        return {
+          message: 'File upload completed',
+          fileId: chunkDto.fileId,
+          finalPath: finalFilePath,
+          totalSize: metadata.fileSize,
+        };
+      } catch (err) {
+        console.error('Error merging chunks:', err);
+        throw new BadRequestException(`Failed to merge chunks: ${err.message}`);
+      }
+    }
+
+    return {
+      message: `Chunk ${chunkDto.chunkIndex + 1}/${metadata.totalChunks} uploaded`,
+      fileId: chunkDto.fileId,
+      progress: (metadata.uploadedChunks.length / metadata.totalChunks) * 100,
+      remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
+    };
+  }
+
+  // 7. CHUNKED UPLOAD - APPROACH 3: Custom File Handler with Pre-parsing
+  @Post('chunk/upload-custom')
+  @UseInterceptors(
+    FileInterceptor('chunk', {
+      storage: diskStorage({
+        destination: (req, file, cb) => {
+          // Extract fileId from filename pattern or use fallback
+          const fileId = req.headers['x-file-id'] as string || 'unknown';
+          
+          if (fileId === 'unknown') {
+            return cb(new Error('fileId must be provided in x-file-id header'), '');
+          }
+
+          const dest = path.join('uploads', 'chunks', fileId);
+          if (!fs.existsSync(dest)) {
+            fs.mkdirSync(dest, { recursive: true });
+          }
           cb(null, dest);
         },
         filename: (req, file, cb) => {
-          const chunkIndex = (req.body as ChunkUploadDto).chunkIndex;
+          const chunkIndex = req.headers['x-chunk-index'] as string || '0';
           cb(null, `chunk-${chunkIndex}`);
         },
       }),
@@ -289,55 +556,85 @@ export class FileUploadController {
       },
     }),
   )
-  uploadChunk(@UploadedFile() chunk: Express.Multer.File, @Body() chunkDto: ChunkUploadDto) {
+  async uploadChunkCustom(@UploadedFile() chunk: Express.Multer.File, @Body() chunkDto: ChunkUploadDto) {
     if (!chunk) {
       throw new BadRequestException('No chunk uploaded');
     }
 
-    const uploadDir = `./uploads/chunks/${chunkDto.fileId}`;
-    const metadataPath = `${uploadDir}/metadata.json`;
+    // The file is already in the correct location due to custom destination logic
+    const uploadDir = path.dirname(chunk.path);
+    const metadataPath = path.join(uploadDir, 'metadata.json');
 
     if (!fs.existsSync(metadataPath)) {
+      fs.unlinkSync(chunk.path);
       throw new BadRequestException('Upload session not found');
     }
 
+    // Read and validate metadata
+    let metadata: UploadMetadata;
+    try {
+      metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    } catch (err:unknown) {
+      console.log(err)
+      fs.unlinkSync(chunk.path);
+      throw new BadRequestException('Invalid metadata file');
+    }
+
+    // Check if chunk already exists
+    const existingChunk = metadata.uploadedChunks.find((c) => c.index === chunkDto.chunkIndex);
+    if (existingChunk) {
+      return {
+        message: `Chunk ${chunkDto.chunkIndex + 1}/${metadata.totalChunks} already uploaded`,
+        fileId: chunkDto.fileId,
+        progress: (metadata.uploadedChunks.length / metadata.totalChunks) * 100,
+        remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
+      };
+    }
+
     // Update metadata
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const metadata: UploadMetadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
     metadata.uploadedChunks.push({
       index: chunkDto.chunkIndex,
       size: chunk.size,
       uploadedAt: new Date().toISOString(),
     });
 
-    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+    try {
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+    } catch (err) {
+      console.log(err)
+      throw new BadRequestException('Failed to update metadata');
+    }
 
     const isComplete = metadata.uploadedChunks.length === metadata.totalChunks;
 
     if (isComplete) {
-      // Merge chunks
-      const finalFilePath = this.mergeChunks(chunkDto.fileId, metadata);
-      metadata.status = 'completed';
-      metadata.finalPath = finalFilePath;
-      fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+      try {
+        const finalFilePath = await this.mergeChunks(chunkDto.fileId, metadata);
+        metadata.status = 'completed';
+        metadata.finalPath = finalFilePath;
+        fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
 
-      return {
-        message: 'File upload completed',
-        fileId: chunkDto.fileId,
-        finalPath: finalFilePath,
-        totalSize: metadata.fileSize,
-      };
+        return {
+          message: 'File upload completed',
+          fileId: chunkDto.fileId,
+          finalPath: finalFilePath,
+          totalSize: metadata.fileSize,
+        };
+      } catch (err) {
+        console.log(err)
+        throw new BadRequestException('Failed to merge chunks');
+      }
     }
 
     return {
-      message: `Chunk ${chunkDto.chunkIndex + 1}/${chunkDto.totalChunks} uploaded`,
+      message: `Chunk ${chunkDto.chunkIndex + 1}/${metadata.totalChunks} uploaded`,
       fileId: chunkDto.fileId,
       progress: (metadata.uploadedChunks.length / metadata.totalChunks) * 100,
       remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
     };
   }
 
-  // 6. CHUNKED UPLOAD - Get Status
+  // 8. CHUNKED UPLOAD - Get Status
   @Post('chunk/status')
   getChunkUploadStatus(@Body() { fileId }: { fileId: string }) {
     const metadataPath = `./uploads/chunks/${fileId}/metadata.json`;
@@ -358,7 +655,55 @@ export class FileUploadController {
       totalChunks: metadata.totalChunks,
       fileName: metadata.fileName,
       remainingChunks: metadata.totalChunks - metadata.uploadedChunks.length,
+      missingChunks: this.getMissingChunks(metadata),
     };
+  }
+
+  // 9. CHUNKED UPLOAD - Resume/Retry missing chunks
+  @Post('chunk/resume')
+  resumeChunkedUpload(@Body() { fileId }: { fileId: string }) {
+    const metadataPath = `./uploads/chunks/${fileId}/metadata.json`;
+
+    if (!fs.existsSync(metadataPath)) {
+      throw new BadRequestException('Upload session not found');
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const metadata: UploadMetadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    const missingChunks = this.getMissingChunks(metadata);
+
+    return {
+      message: 'Resume information retrieved',
+      fileId,
+      fileName: metadata.fileName,
+      totalChunks: metadata.totalChunks,
+      uploadedChunks: metadata.uploadedChunks.length,
+      missingChunks,
+      nextChunkToUpload: missingChunks.length > 0 ? missingChunks[0] : null,
+    };
+  }
+
+  // 10. CHUNKED UPLOAD - Cancel/Cleanup
+  @Post('chunk/cancel')
+  cancelChunkedUpload(@Body() { fileId }: { fileId: string }) {
+    const uploadDir = `./uploads/chunks/${fileId}`;
+
+    if (!fs.existsSync(uploadDir)) {
+      throw new BadRequestException('Upload session not found');
+    }
+
+    try {
+      // Remove all chunk files and metadata
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+      
+      return {
+        message: 'Upload session cancelled and cleaned up',
+        fileId,
+      };
+    } catch (err) {
+      console.log(err)
+      throw new BadRequestException('Failed to cleanup upload session');
+    }
   }
 
   // HELPER METHODS
@@ -391,33 +736,135 @@ export class FileUploadController {
     return { fieldName, files: processedFiles };
   }
 
-  private mergeChunks(fileId: string, metadata: UploadMetadata): string {
-    const uploadDir = `./uploads/chunks/${fileId}`;
-    const finalDir = './uploads/completed';
+private async mergeChunks(fileId: string, metadata: UploadMetadata): Promise<string> {
+  const chunkDir = path.join('uploads', 'chunks', fileId);
+  const finalDir = path.join('uploads', 'completed');
+  
+  // Ensure final directory exists
+  if (!fs.existsSync(finalDir)) {
+    fs.mkdirSync(finalDir, { recursive: true });
+  }
 
-    if (!fs.existsSync(finalDir)) {
-      fs.mkdirSync(finalDir, { recursive: true });
+  const finalFilePath = path.join(finalDir, metadata.fileName);
+
+  try {
+    // Sort chunks by index to ensure correct order
+    const sortedChunks = metadata.uploadedChunks
+      .sort((a, b) => a.index - b.index);
+
+    // Validate we have all chunks
+    if (sortedChunks.length !== metadata.totalChunks) {
+      throw new Error(`Missing chunks: expected ${metadata.totalChunks}, got ${sortedChunks.length}`);
     }
 
-    const finalFilePath = `${finalDir}/${metadata.fileName}`;
+    // Create write stream for final file
     const writeStream = fs.createWriteStream(finalFilePath);
 
-    // Sort chunks by index and merge
-    const sortedChunks = metadata.uploadedChunks.sort((a, b) => a.index - b.index);
+    // Read and write chunks in order
+    for (let i = 0; i < sortedChunks.length; i++) {
+      const chunkPath = path.join(chunkDir, `chunk-${sortedChunks[i].index}`);
+      
+      if (!fs.existsSync(chunkPath)) {
+        throw new Error(`Chunk file not found: ${chunkPath}`);
+      }
 
-    for (const chunkInfo of sortedChunks) {
-      const chunkPath = `${uploadDir}/chunk-${chunkInfo.index}`;
       const chunkData = fs.readFileSync(chunkPath);
       writeStream.write(chunkData);
     }
 
     writeStream.end();
 
+    // Wait for stream to finish
+    await new Promise((resolve, reject) => {
+      writeStream.on('finish',()=>resolve);
+      writeStream.on('error', reject);
+    });
+
     // Clean up chunk files
-    setTimeout(() => {
-      fs.rmSync(uploadDir, { recursive: true, force: true });
-    }, 5000); // Delete after 5 seconds
+    for (const chunk of sortedChunks) {
+      const chunkPath = path.join(chunkDir, `chunk-${chunk.index}`);
+      if (fs.existsSync(chunkPath)) {
+        fs.unlinkSync(chunkPath);
+      }
+    }
+
+    // Remove chunk directory and metadata
+    const metadataPath = path.join(chunkDir, 'metadata.json');
+    if (fs.existsSync(metadataPath)) {
+      fs.unlinkSync(metadataPath);
+    }
+    
+    if (fs.existsSync(chunkDir)) {
+      fs.rmdirSync(chunkDir);
+    }
 
     return finalFilePath;
+
+  } catch (error) {
+    // Clean up partial file if it exists
+    if (fs.existsSync(finalFilePath)) {
+      fs.unlinkSync(finalFilePath);
+    }
+    throw error;
+  }
+}
+
+  private getMissingChunks(metadata: UploadMetadata): number[] {
+    const uploadedIndices = new Set(metadata.uploadedChunks.map(chunk => chunk.index));
+    const missingChunks: number[] = [];
+    
+    for (let i = 0; i < metadata.totalChunks; i++) {
+      if (!uploadedIndices.has(i)) {
+        missingChunks.push(i);
+      }
+    }
+    
+    return missingChunks;
+  }
+
+  // 11. BONUS: Stream Upload for very large files
+  @Post('stream')
+  async uploadStream(@Body() streamDto: { fileName: string; contentType: string }) {
+    const fileId = crypto.randomUUID();
+    const uploadDir = './uploads/stream';
+    await new Promise((resolve) => resolve("Success"));
+
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+
+    const filePath = path.join(uploadDir, `${fileId}-${streamDto.fileName}`);
+    
+    return {
+      message: 'Stream upload endpoint ready',
+      fileId,
+      uploadUrl: `/upload/stream/${fileId}`,
+      instructions: 'Send raw file data to the upload URL using PUT method'
+    };
+  }
+
+  // 12. Health check endpoint
+  @Post('health')
+  healthCheck() {
+    const uploadDirs = [
+      './uploads/single',
+      './uploads/multiple', 
+      './uploads/chunks',
+      './uploads/completed',
+      './uploads/temp'
+    ];
+
+    const dirStatus = uploadDirs.map(dir => ({
+      directory: dir,
+      exists: fs.existsSync(dir),
+      writable: fs.existsSync(dir) ? fs.accessSync(dir, fs.constants.W_OK) === undefined : false
+    }));
+
+    return {
+      message: 'File upload service is healthy',
+      timestamp: new Date().toISOString(),
+      directories: dirStatus,
+      memoryUsage: process.memoryUsage(),
+    };
   }
 }

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import React, { useState, useRef } from 'react';
 import axios from 'axios';
-import { Upload, File, FileText, Image, User, Trash2, CheckCircle, AlertCircle, RotateCcw } from 'lucide-react';
+import { Upload, File, FileText, Image, User, Trash2, CheckCircle, AlertCircle, RotateCcw, HardDrive, MemoryStick } from 'lucide-react';
 
 const API_BASE_URL = 'http://localhost:3000/upload';
 
@@ -21,6 +21,8 @@ interface ChunkUploadResponse {
   remainingChunks?: number;
   finalPath?: string;
   totalSize?: number;
+  fileName?: string; // Added for status check
+  totalChunks?: number; // Added for status check
 }
 
 interface UploadProgress {
@@ -34,29 +36,34 @@ const FileUploadApp: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'single' | 'multiple' | 'mixed' | 'chunked'>('single');
   const [uploadProgress, setUploadProgress] = useState<UploadProgress[]>([]);
   const [isUploading, setIsUploading] = useState(false);
-  
+
   // Single file upload
   const [singleFile, setSingleFile] = useState<File | null>(null);
   const [singleDescription, setSingleDescription] = useState('');
   const [singleCategory, setSingleCategory] = useState('');
-  
+
   // Multiple files upload
   const [multipleFiles, setMultipleFiles] = useState<File[]>([]);
   const [multipleDescription, setMultipleDescription] = useState('');
   const [multipleCategory, setMultipleCategory] = useState('');
-  
+
   // Mixed fields upload
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const [documentFiles, setDocumentFiles] = useState<File[]>([]);
   const [imageFiles, setImageFiles] = useState<File[]>([]);
   const [mixedDescription, setMixedDescription] = useState('');
-  
+
   // Chunked upload
   const [chunkedFile, setChunkedFile] = useState<File | null>(null);
   const [chunkSize] = useState(5 * 1024 * 1024); // 5MB chunks
   const [chunkUploadId, setChunkUploadId] = useState<string>('');
   const [chunkProgress, setChunkProgress] = useState(0);
-  
+  const [chunkStatus, setChunkStatus] = useState<ChunkUploadResponse | null>(null);
+  const [statusCheckId, setStatusCheckId] = useState<string>('');
+  // New state for chunk storage method
+  const [chunkStorageMethod, setChunkStorageMethod] = useState<'disk' | 'memory'>('disk');
+
+
   const fileInputRefs = {
     single: useRef<HTMLInputElement>(null),
     multiple: useRef<HTMLInputElement>(null),
@@ -79,8 +86,8 @@ const FileUploadApp: React.FC = () => {
     setUploadProgress(prev => {
       const existing = prev.find(p => p.fileName === fileName);
       if (existing) {
-        return prev.map(p => 
-          p.fileName === fileName 
+        return prev.map(p =>
+          p.fileName === fileName
             ? { ...p, progress, status, message }
             : p
         );
@@ -93,20 +100,36 @@ const FileUploadApp: React.FC = () => {
     setUploadProgress([]);
   };
 
+  // Chunked upload status check
+  const handleChunkStatusCheck = async () => {
+    if (!statusCheckId.trim()) return;
+
+    try {
+      const response = await axios.post<ChunkUploadResponse>(`${API_BASE_URL}/chunk/status`, {
+        fileId: statusCheckId,
+      });
+
+      setChunkStatus(response.data);
+    } catch (error: any) {
+      alert(`Failed to get upload status: ${error.response?.data?.message || error.message || 'Upload session may not exist.'}`);
+      setChunkStatus(null);
+    }
+  };
+
   // Single file upload
   const handleSingleFileUpload = async () => {
     if (!singleFile) return;
-    
+
     setIsUploading(true);
     updateProgress(singleFile.name, 0, 'uploading');
-    
+
     const formData = new FormData();
     formData.append('file', singleFile);
     formData.append('description', singleDescription);
     formData.append('category', singleCategory);
-    
+
     try {
-      const response = await axios.post(`${API_BASE_URL}/single`, formData, {
+      const response = await axios.post<FileUploadResponse>(`${API_BASE_URL}/single`, formData, {
         onUploadProgress: (progressEvent) => {
           if (progressEvent.total) {
             const percentComplete = Math.round(
@@ -124,8 +147,8 @@ const FileUploadApp: React.FC = () => {
       if (fileInputRefs.single.current) {
         fileInputRefs.single.current.value = '';
       }
-    } catch (error) {
-      updateProgress(singleFile.name, 0, 'error', 'Upload failed');
+    } catch (error: any) {
+      updateProgress(singleFile.name, 0, 'error', `Upload failed: ${error.response?.data?.message || error.message}`);
     } finally {
       setIsUploading(false);
     }
@@ -134,20 +157,20 @@ const FileUploadApp: React.FC = () => {
   // Multiple files upload
   const handleMultipleFilesUpload = async () => {
     if (multipleFiles.length === 0) return;
-    
+
     setIsUploading(true);
-    
+
     // Initialize progress for all files
     multipleFiles.forEach(file => {
       updateProgress(file.name, 0, 'uploading');
     });
-    
+
     const uploadPromises = multipleFiles.map(file => {
       const formData = new FormData();
       formData.append('files', file);
       formData.append('description', multipleDescription);
       formData.append('category', multipleCategory);
-      
+
       return axios.post(`${API_BASE_URL}/multiple-parallel`, formData, {
         onUploadProgress: (progressEvent) => {
           if (progressEvent.total) {
@@ -159,7 +182,7 @@ const FileUploadApp: React.FC = () => {
         },
       });
     });
-    
+
     try {
       await Promise.all(uploadPromises);
       multipleFiles.forEach(file => {
@@ -171,9 +194,9 @@ const FileUploadApp: React.FC = () => {
       if (fileInputRefs.multiple.current) {
         fileInputRefs.multiple.current.value = '';
       }
-    } catch (error) {
+    } catch (error: any) {
       multipleFiles.forEach(file => {
-        updateProgress(file.name, 0, 'error', 'Upload failed');
+        updateProgress(file.name, 0, 'error', `Upload failed: ${error.response?.data?.message || error.message}`);
       });
     } finally {
       setIsUploading(false);
@@ -183,49 +206,46 @@ const FileUploadApp: React.FC = () => {
   // Mixed fields upload
   const handleMixedFieldsUpload = async () => {
     if (!avatarFile && documentFiles.length === 0 && imageFiles.length === 0) return;
-    
+
     setIsUploading(true);
-    
+
     const allFiles = [
       ...(avatarFile ? [avatarFile] : []),
       ...documentFiles,
       ...imageFiles
     ];
-    
+
     allFiles.forEach(file => {
       updateProgress(file.name, 0, 'uploading');
     });
-    
-    const uploadPromises = allFiles.map(file => {
-      const formData = new FormData();
-      
-      // Determine the field name based on file type
-      if (avatarFile && file === avatarFile) {
-        formData.append('avatar', file);
-      } else if (documentFiles.includes(file)) {
-        formData.append('documents', file);
-      } else {
-        formData.append('images', file);
-      }
-      
-      formData.append('description', mixedDescription);
-      
-      return axios.post(`${API_BASE_URL}/mixed-fields`, formData, {
+
+    // Create a single FormData object for mixed fields upload
+    const formData = new FormData();
+    if (avatarFile) formData.append('avatar', avatarFile);
+    documentFiles.forEach(file => formData.append('documents', file));
+    imageFiles.forEach(file => formData.append('images', file));
+    formData.append('description', mixedDescription);
+
+    try {
+      const response = await axios.post<FileUploadResponse>(`${API_BASE_URL}/mixed-fields`, formData, {
         onUploadProgress: (progressEvent) => {
           if (progressEvent.total) {
             const percentComplete = Math.round(
               (progressEvent.loaded * 100) / progressEvent.total
             );
-            updateProgress(file.name, percentComplete, 'uploading');
+            // This progress will be for the entire mixed upload, not per file
+            // For per-file progress in mixed, the backend would need to send updates per file field
+            if (allFiles.length > 0) {
+              // We'll update the first file's progress with overall progress for simplicity
+              updateProgress(allFiles[0].name, percentComplete, 'uploading', `Overall progress: ${percentComplete}%`);
+            }
           }
         },
       });
-    });
-    
-    try {
-      await Promise.all(uploadPromises);
+
+      // Mark all files as completed
       allFiles.forEach(file => {
-        updateProgress(file.name, 100, 'completed', 'Processed successfully');
+        updateProgress(file.name, 100, 'completed', response.data.message || 'Processed successfully');
       });
       setAvatarFile(null);
       setDocumentFiles([]);
@@ -234,9 +254,9 @@ const FileUploadApp: React.FC = () => {
       Object.values(fileInputRefs).forEach(ref => {
         if (ref.current) ref.current.value = '';
       });
-    } catch (error) {
+    } catch (error: any) {
       allFiles.forEach(file => {
-        updateProgress(file.name, 0, 'error', 'Upload failed');
+        updateProgress(file.name, 0, 'error', `Upload failed: ${error.response?.data?.message || error.message}`);
       });
     } finally {
       setIsUploading(false);
@@ -246,70 +266,147 @@ const FileUploadApp: React.FC = () => {
   // Chunked upload
   const handleChunkedUpload = async () => {
     if (!chunkedFile) return;
-    
+
     setIsUploading(true);
     setChunkProgress(0);
     updateProgress(chunkedFile.name, 0, 'uploading');
-    
+
     const totalChunks = Math.ceil(chunkedFile.size / chunkSize);
-    
+    const maxRetries = 3;
+
+    // Determine the chunk upload endpoint based on user selection
+    const chunkUploadEndpoint = chunkStorageMethod === 'disk' ?
+      `${API_BASE_URL}/chunk/upload` :
+      `${API_BASE_URL}/chunk/upload-memory`;
+
     try {
       // Start chunked upload
-      const startResponse = await axios.post(`${API_BASE_URL}/chunk/start`, {
+      const startResponse = await axios.post<ChunkUploadResponse>(`${API_BASE_URL}/chunk/start`, {
         fileName: chunkedFile.name,
         fileSize: chunkedFile.size,
         totalChunks,
+        // Potentially pass the storage method to the backend if it influences session creation
+        storageMethod: chunkStorageMethod // Send this to backend
       });
-      
+
       const fileId = startResponse.data.fileId;
       setChunkUploadId(fileId);
-      
-      // Upload chunks
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * chunkSize;
-        const end = Math.min(start + chunkSize, chunkedFile.size);
-        const chunk = chunkedFile.slice(start, end);
-        
-        const chunkFormData = new FormData();
-        chunkFormData.append('chunk', chunk);
-        chunkFormData.append('chunkIndex', i.toString());
-        chunkFormData.append('totalChunks', totalChunks.toString());
-        chunkFormData.append('fileName', chunkedFile.name);
-        chunkFormData.append('fileId', fileId);
-        
-        await axios.post(`${API_BASE_URL}/chunk/upload`, chunkFormData, {
-          onUploadProgress: (progressEvent) => {
-            if (progressEvent.total) {
-              const chunkPercent = Math.round(
-                (progressEvent.loaded * 100) / progressEvent.total
-              );
-              const overallProgress = Math.round(
-                ((i * chunkSize + progressEvent.loaded) / chunkedFile.size) * 100
-              );
-              setChunkProgress(overallProgress);
-              updateProgress(
-                chunkedFile.name, 
-                overallProgress, 
-                'uploading', 
-                `Chunk ${i + 1}/${totalChunks} (${chunkPercent}%)`
-              );
+
+      // Upload chunks with retry logic
+      const uploadChunk = async (chunkIndex: number, retryCount = 0): Promise<void> => {
+        try {
+          const start = chunkIndex * chunkSize;
+          const end = Math.min(start + chunkSize, chunkedFile.size);
+          const chunk = chunkedFile.slice(start, end);
+
+          const chunkFormData = new FormData();
+          chunkFormData.append('chunk', chunk);
+          chunkFormData.append('chunkIndex', chunkIndex.toString());
+          chunkFormData.append('totalChunks', totalChunks.toString());
+          chunkFormData.append('fileName', chunkedFile.name);
+          chunkFormData.append('fileId', fileId);
+          // Add storage method to each chunk if backend needs it for individual chunk handling
+          chunkFormData.append('storageMethod', chunkStorageMethod);
+
+          const response = await axios.post<ChunkUploadResponse>(chunkUploadEndpoint, chunkFormData, {
+            onUploadProgress: (progressEvent) => {
+              if (progressEvent.total) {
+                const chunkPercent = Math.round(
+                  (progressEvent.loaded * 100) / progressEvent.total
+                );
+                const overallProgress = Math.round(
+                  ((chunkIndex * chunkSize + progressEvent.loaded) / chunkedFile.size) * 100
+                );
+                setChunkProgress(overallProgress);
+                updateProgress(
+                  chunkedFile.name,
+                  overallProgress,
+                  'uploading',
+                  `Chunk ${chunkIndex + 1}/${totalChunks} (${chunkPercent}%)`
+                );
+              }
+            },
+            // Timeout set to 30 minutes (30 * 60 * 1000 milliseconds)
+            timeout: 30 * 60 * 1000,
+          });
+
+          return response.data as any;
+        } catch (error: any) {
+          if (retryCount < maxRetries) {
+            console.warn(`Retrying chunk ${chunkIndex} (attempt ${retryCount + 1})...`);
+            // Exponential backoff
+            const delay = Math.pow(2, retryCount) * 1000;
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return uploadChunk(chunkIndex, retryCount + 1);
+          }
+          throw error;
+        }
+      };
+
+      // Upload all chunks with concurrency control
+      const concurrencyLimit = 3;
+      const chunksToUpload = Array.from({ length: totalChunks }, (_, i) => i);
+      const uploadQueue = [...chunksToUpload];
+      const activeUploads: Promise<void>[] = [];
+
+      const processQueue = async () => {
+        while (uploadQueue.length > 0 || activeUploads.length > 0) {
+          while (uploadQueue.length > 0 && activeUploads.length < concurrencyLimit) {
+            const chunkIndex = uploadQueue.shift();
+            if (chunkIndex !== undefined) {
+              const uploadPromise = uploadChunk(chunkIndex)
+                .finally(() => {
+                  // Remove the promise from activeUploads once it's settled
+                  activeUploads.splice(activeUploads.indexOf(uploadPromise), 1);
+                });
+              activeUploads.push(uploadPromise);
             }
-          },
-        });
+          }
+          // Wait for at least one active upload to complete before checking again
+          if (activeUploads.length > 0) {
+            await Promise.race(activeUploads);
+          } else if (uploadQueue.length > 0) {
+            // If activeUploads is empty but queue is not, something went wrong with starting
+            // (e.g., all initial chunks failed and queue wasn't cleared, or concurrency issue)
+            break;
+          }
+        }
+      };
+
+      await processQueue();
+
+      // After all chunks are sent, finalize the upload
+      const finalizeResponse = await axios.post<ChunkUploadResponse>(`${API_BASE_URL}/chunk/complete`, {
+        fileId: fileId,
+        fileName: chunkedFile.name,
+        totalChunks: totalChunks,
+        storageMethod: chunkStorageMethod // Send this to backend for finalization
+      });
+
+      if (finalizeResponse.data?.finalPath) {
+        updateProgress(chunkedFile.name, 100, 'completed', 'Upload complete');
+        setChunkedFile(null);
+        setChunkUploadId('');
+        setChunkStatus(null);
+        if (fileInputRefs.chunked.current) {
+          fileInputRefs.chunked.current.value = '';
+        }
+      } else {
+        throw new Error('Upload incomplete after finalization');
       }
-      
-      updateProgress(chunkedFile.name, 100, 'completed', 'Upload complete');
-      setChunkedFile(null);
-      setChunkUploadId('');
-      if (fileInputRefs.chunked.current) {
-        fileInputRefs.chunked.current.value = '';
-      }
-    } catch (error) {
-      updateProgress(chunkedFile.name, 0, 'error', 'Chunked upload failed');
+    } catch (error: any) {
+      console.error('Chunked upload failed:', error);
+      updateProgress(
+        chunkedFile.name,
+        0,
+        'error',
+        `Upload failed: ${error.response?.data?.message || error.message || 'Unknown error'}`
+      );
     } finally {
       setIsUploading(false);
     }
   };
+
 
   const removeFile = (fileList: File[], setFileList: React.Dispatch<React.SetStateAction<File[]>>, index: number) => {
     setFileList(fileList.filter((_, i) => i !== index));
@@ -326,9 +423,9 @@ const FileUploadApp: React.FC = () => {
         </div>
       </div>
       <div className="w-full bg-gray-200 rounded-full h-2">
-        <div 
+        <div
           className={`h-2 rounded-full transition-all duration-300 ${
-            progress.status === 'completed' ? 'bg-green-500' : 
+            progress.status === 'completed' ? 'bg-green-500' :
             progress.status === 'error' ? 'bg-red-500' : 'bg-blue-500'
           }`}
           style={{ width: `${progress.progress}%` }}
@@ -381,7 +478,7 @@ const FileUploadApp: React.FC = () => {
             {activeTab === 'single' && (
               <div className="space-y-6">
                 <h2 className="text-xl font-semibold text-gray-800">Single File Upload</h2>
-                
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -400,7 +497,7 @@ const FileUploadApp: React.FC = () => {
                       </p>
                     )}
                   </div>
-                  
+
                   <div className="space-y-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -414,7 +511,7 @@ const FileUploadApp: React.FC = () => {
                         placeholder="Optional description"
                       />
                     </div>
-                    
+
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">
                         Category
@@ -432,7 +529,7 @@ const FileUploadApp: React.FC = () => {
                     </div>
                   </div>
                 </div>
-                
+
                 <button
                   onClick={handleSingleFileUpload}
                   disabled={!singleFile || isUploading}
@@ -448,7 +545,7 @@ const FileUploadApp: React.FC = () => {
             {activeTab === 'multiple' && (
               <div className="space-y-6">
                 <h2 className="text-xl font-semibold text-gray-800">Multiple Files Upload</h2>
-                
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -462,7 +559,7 @@ const FileUploadApp: React.FC = () => {
                       accept=".jpg,.jpeg,.png,.gif,.pdf,.doc,.docx"
                       className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
                     />
-                    
+
                     {multipleFiles.length > 0 && (
                       <div className="mt-4 space-y-2">
                         <h4 className="text-sm font-medium text-gray-700">Selected Files:</h4>
@@ -482,7 +579,7 @@ const FileUploadApp: React.FC = () => {
                       </div>
                     )}
                   </div>
-                  
+
                   <div className="space-y-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -496,7 +593,7 @@ const FileUploadApp: React.FC = () => {
                         placeholder="Optional description"
                       />
                     </div>
-                    
+
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">
                         Category
@@ -514,7 +611,7 @@ const FileUploadApp: React.FC = () => {
                     </div>
                   </div>
                 </div>
-                
+
                 <button
                   onClick={handleMultipleFilesUpload}
                   disabled={multipleFiles.length === 0 || isUploading}
@@ -530,7 +627,7 @@ const FileUploadApp: React.FC = () => {
             {activeTab === 'mixed' && (
               <div className="space-y-6">
                 <h2 className="text-xl font-semibold text-gray-800">Mixed Fields Upload</h2>
-                
+
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -550,7 +647,7 @@ const FileUploadApp: React.FC = () => {
                       </p>
                     )}
                   </div>
-                  
+
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
                       <FileText className="w-4 h-4 inline mr-1" />
@@ -570,7 +667,7 @@ const FileUploadApp: React.FC = () => {
                       </p>
                     )}
                   </div>
-                  
+
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
                       <Image className="w-4 h-4 inline mr-1" />
@@ -591,7 +688,7 @@ const FileUploadApp: React.FC = () => {
                     )}
                   </div>
                 </div>
-                
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
                     Description
@@ -604,7 +701,7 @@ const FileUploadApp: React.FC = () => {
                     placeholder="Optional description"
                   />
                 </div>
-                
+
                 <button
                   onClick={handleMixedFieldsUpload}
                   disabled={(!avatarFile && documentFiles.length === 0 && imageFiles.length === 0) || isUploading}
@@ -623,7 +720,39 @@ const FileUploadApp: React.FC = () => {
                 <p className="text-sm text-gray-600">
                   For large files, uploads are split into {formatFileSize(chunkSize)} chunks for better reliability.
                 </p>
-                
+
+                {/* Chunk Storage Method Selection */}
+                <div className="border p-4 rounded-md bg-gray-50">
+                  <h3 className="text-md font-medium text-gray-800 mb-2">Chunk Storage Method:</h3>
+                  <div className="flex items-center space-x-4">
+                    <label className="inline-flex items-center">
+                      <input
+                        type="radio"
+                        className="form-radio text-blue-600"
+                        name="chunkStorage"
+                        value="disk"
+                        checked={chunkStorageMethod === 'disk'}
+                        onChange={() => setChunkStorageMethod('disk')}
+                      />
+                      <span className="ml-2 text-gray-700 flex items-center"><HardDrive className="w-4 h-4 mr-1"/> Disk Storage</span>
+                    </label>
+                    <label className="inline-flex items-center">
+                      <input
+                        type="radio"
+                        className="form-radio text-purple-600"
+                        name="chunkStorage"
+                        value="memory"
+                        checked={chunkStorageMethod === 'memory'}
+                        onChange={() => setChunkStorageMethod('memory')}
+                      />
+                      <span className="ml-2 text-gray-700 flex items-center"><MemoryStick className="w-4 h-4 mr-1"/> Memory Storage (Use with caution for very large files)</span>
+                    </label>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">
+                    **Disk Storage** saves chunks to temporary files on the server. **Memory Storage** keeps chunks in RAM, which is faster but can consume significant server memory for large files.
+                  </p>
+                </div>
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
                     Select Large File
@@ -648,7 +777,17 @@ const FileUploadApp: React.FC = () => {
                     </div>
                   )}
                 </div>
-                
+
+                <button
+                  onClick={handleChunkedUpload}
+                  disabled={!chunkedFile || isUploading}
+                  className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                >
+                  <Upload className="w-4 h-4 mr-2" />
+                  Start Chunked Upload ({chunkStorageMethod === 'disk' ? 'Disk' : 'Memory'})
+                </button>
+
+
                 {chunkUploadId && (
                   <div className="bg-blue-50 p-4 rounded-md">
                     <p className="text-sm text-blue-700">
@@ -660,7 +799,7 @@ const FileUploadApp: React.FC = () => {
                         <span>{Math.round(chunkProgress)}%</span>
                       </div>
                       <div className="w-full bg-blue-200 rounded-full h-2">
-                        <div 
+                        <div
                           className="bg-blue-600 h-2 rounded-full transition-all duration-300"
                           style={{ width: `${chunkProgress}%` }}
                         />
@@ -668,44 +807,95 @@ const FileUploadApp: React.FC = () => {
                     </div>
                   </div>
                 )}
-                
-                <button
-                  onClick={handleChunkedUpload}
-                  disabled={!chunkedFile || isUploading}
-                  className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
-                >
-                  <Upload className="w-4 h-4 mr-2" />
-                  {isUploading ? 'Uploading Chunks...' : 'Start Chunked Upload'}
-                </button>
+
+                {/* Chunk Status Check Section */}
+                <div className="border-t pt-6">
+                  <h3 className="text-lg font-medium text-gray-800 mb-4">Check Upload Status</h3>
+                  <p className="text-sm text-gray-600 mb-4">
+                    Enter your upload ID to check the status of an ongoing or completed chunked upload.
+                  </p>
+                  <div className="flex space-x-2">
+                    <input
+                      type="text"
+                      value={statusCheckId}
+                      onChange={(e) => setStatusCheckId(e.target.value)}
+                      placeholder="Enter upload ID"
+                      className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <button
+                      onClick={handleChunkStatusCheck}
+                      className="bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700"
+                    >
+                      Check Status
+                    </button>
+                  </div>
+
+                  {chunkStatus && (
+                    <div className="mt-4 bg-gray-50 p-4 rounded-md">
+                      <h4 className="font-medium text-gray-800 mb-2">Upload Status</h4>
+                      <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                          <span className="text-gray-600">File Name:</span>
+                          <span className="ml-2 text-gray-800">{chunkStatus.fileName || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">File Size:</span>
+                          <span className="ml-2 text-gray-800">{formatFileSize(chunkStatus.totalSize || 0)}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Chunks Received:</span>
+                          <span className="ml-2 text-gray-800">
+                            {(chunkStatus.totalChunks && chunkStatus.remainingChunks !== undefined)
+                              ? `${chunkStatus.totalChunks - chunkStatus.remainingChunks}/${chunkStatus.totalChunks}`
+                              : 'N/A'}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Overall Progress:</span>
+                          <span className="ml-2 text-gray-800">
+                            {chunkStatus.progress !== undefined ? `${Math.round(chunkStatus.progress)}%` : 'N/A'}
+                          </span>
+                        </div>
+                        {chunkStatus.finalPath && (
+                          <div className="col-span-2">
+                            <span className="text-gray-600">Final Path:</span>
+                            <span className="ml-2 text-gray-800 break-all">{chunkStatus.finalPath}</span>
+                          </div>
+                        )}
+                        <div className="col-span-2">
+                          <span className="text-gray-600">Message:</span>
+                          <span className="ml-2 text-gray-800">{chunkStatus.message}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
               </div>
             )}
 
-            {/* Progress Section */}
+            {/* Global Upload Progress Display */}
             {uploadProgress.length > 0 && (
-              <div className="mt-8 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-lg font-semibold text-gray-800">Upload Progress</h3>
-                  <button
-                    onClick={clearProgress}
-                    className="text-sm text-gray-500 hover:text-gray-700 flex items-center"
-                  >
-                    <Trash2 className="w-4 h-4 mr-1" />
-                    Clear all
-                  </button>
+              <>
+                <div className="mt-8 border-t pt-6">
+                  <div className="flex justify-between items-center mb-4">
+                    <h2 className="text-xl font-semibold text-gray-800">Current Uploads</h2>
+                    <button
+                      onClick={clearProgress}
+                      className="text-red-500 hover:text-red-700 text-sm flex items-center"
+                    >
+                      <Trash2 className="w-4 h-4 mr-1" /> Clear All
+                    </button>
+                  </div>
+                  <div className="space-y-3">
+                    {uploadProgress.map((p, index) => (
+                      <ProgressBar key={index} progress={p} />
+                    ))}
+                  </div>
                 </div>
-                
-                <div className="space-y-3">
-                  {uploadProgress.map((progress, index) => (
-                    <ProgressBar key={index} progress={progress} />
-                  ))}
-                </div>
-              </div>
+              </>
             )}
           </div>
-        </div>
-        
-        <div className="mt-6 text-center text-sm text-gray-500">
-          <p>File Upload Demo using React and Express</p>
         </div>
       </div>
     </div>
