@@ -45,13 +45,13 @@ export class ChunkUploadService {
 
   private async saveUploadStatus() {
     try {
-      await fs.promises.writeFile(this.statusFilePath, JSON.stringify(this.activeUploads, null, 2));
+      await fs.promises.writeFile(this.statusFile, JSON.stringify(this.activeUploads, null, 2));
     } catch (error) {
       this.logger.error('Failed to save upload status', error);
     }
   }
 
-  getUploadStatus(fileId: string): Promise<UploadStatusResponse> {
+  getUploadStatus(fileId: string): UploadStatusResponse {
     const upload = this.activeUploads[fileId];
     if (!upload) return { exists: false };
 

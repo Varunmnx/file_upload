@@ -1,15 +1,15 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import axios from 'axios';
-import './index.css';
+import './index.css'; // Assuming your CSS is already set up
 
 interface FileProgress {
   name: string;
-  progress: number;
+  progress: number; // Overall progress for THIS file (0-100)
   status: 'pending' | 'uploading' | 'paused' | 'completed' | 'error';
   message?: string;
   fileId?: string;
   totalChunks?: number;
-  uploadedChunks?: number[];
+  uploadedChunks?: number[]; // List of successfully uploaded chunk indices
   fileSize?: number;
   chunkSize?: number;
   storageMethod?: 'disk' | 'memory';
@@ -27,7 +27,7 @@ interface UploadStatusResponse {
   fileName?: string;
   fileSize?: number;
   totalChunks?: number;
-  uploadedChunks?: number[];
+  uploadedChunks?: number[]; // Chunks known to the server
   storageMethod?: 'disk' | 'memory';
   lastUpdated?: string;
 }
@@ -40,13 +40,188 @@ const ChunkedUploader: React.FC = () => {
   const [chunkStorageMethod, setChunkStorageMethod] = useState<'disk' | 'memory'>('disk');
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
-  const [chunkProgress, setChunkProgress] = useState<number>(0);
-  const [chunkUploadId, setChunkUploadId] = useState<string>('');
-  const [chunkStatus, setChunkStatus] = useState<string | null>(null);
+  // Removed chunkProgress, as per-file progress is now in filesProgress state
+  const [overallSiteProgress, setOverallSiteProgress] = useState<number>(0); // Progress across ALL files
+  const [currentFileStatusMessage, setCurrentFileStatusMessage] = useState<string | null>(null); // Status for the currently selected file
+  const [currentFileId, setCurrentFileId] = useState<string>(''); // File ID for the currently selected file
+
   const [filesProgress, setFilesProgress] = useState<Record<string, FileProgress>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const activeUploadsRef = useRef<AbortController[]>([]);
   const isMountedRef = useRef(true);
+  const activeChunkAbortControllersRef = useRef<Map<number, AbortController>>(new Map()); // Map of chunkIndex to AbortController
+
+  // --- Utility Functions (moved inside component or memoized) ---
+
+  const updateProgress = useCallback(
+    (
+      fileName: string,
+      progress: number,
+      status: FileProgress['status'],
+      message?: string,
+      fileId?: string,
+      totalChunks?: number,
+      uploadedChunks?: number[]
+    ) => {
+      setFilesProgress(prev => {
+        const currentFileEntry = prev[fileName];
+        const newUploadedChunks = uploadedChunks ? Array.from(new Set(uploadedChunks)).sort((a, b) => a - b) : currentFileEntry?.uploadedChunks;
+
+        const updatedFilesProgress = {
+          ...prev,
+          [fileName]: {
+            ...currentFileEntry, // Keep existing fields
+            name: fileName,
+            progress,
+            status,
+            message,
+            fileId: fileId || currentFileEntry?.fileId,
+            totalChunks: totalChunks || currentFileEntry?.totalChunks,
+            uploadedChunks: newUploadedChunks || [],
+            fileSize: currentFileEntry?.fileSize || chunkedFile?.size, // Use currentFileEntry's size if available
+            chunkSize: currentFileEntry?.chunkSize || chunkSize,
+            storageMethod: currentFileEntry?.storageMethod || chunkStorageMethod
+          }
+        };
+
+        // Calculate overall site progress
+        const totalFiles = Object.keys(updatedFilesProgress).length;
+        if (totalFiles === 0) {
+          setOverallSiteProgress(0);
+          return updatedFilesProgress;
+        }
+
+        const aggregatedProgress = Object.values(updatedFilesProgress).reduce((sum, file) => {
+          // Weighted average based on progress * (file's total chunks) or just its progress
+          // For simplicity, let's just average the individual file progress
+          return sum + (file.progress || 0);
+        }, 0);
+
+        setOverallSiteProgress(Math.round(aggregatedProgress / totalFiles));
+
+        return updatedFilesProgress;
+      });
+    },
+    [chunkedFile, chunkSize, chunkStorageMethod] // Dependencies for useCallback
+  );
+
+  const checkUploadStatus = useCallback(async (fileId: string): Promise<UploadStatusResponse> => {
+    try {
+      const response = await axios.get<UploadStatusResponse>(
+        `${API_BASE_URL}/status/${fileId}`
+      );
+      return response.data;
+    } catch (error) {
+      console.error('Error checking upload status:', error);
+      return { exists: false };
+    }
+  }, []);
+
+  const uploadChunkWithRetry = useCallback(
+    async (
+      chunk: Blob,
+      chunkIndex: number,
+      totalChunks: number,
+      fileName: string,
+      fileId: string,
+      endpoint: string,
+      maxRetries: number = 3
+    ): Promise<ChunkUploadResponse> => {
+      let retryCount = 0;
+      const chunkFormData = new FormData();
+      chunkFormData.append('chunk', chunk, `${fileName}.part${chunkIndex}`);
+      chunkFormData.append('chunkIndex', chunkIndex.toString());
+      chunkFormData.append('totalChunks', totalChunks.toString());
+      chunkFormData.append('fileName', fileName);
+      chunkFormData.append('fileId', fileId);
+      chunkFormData.append('storageMethod', chunkStorageMethod);
+
+      const controller = new AbortController();
+      activeChunkAbortControllersRef.current.set(chunkIndex, controller);
+
+      while (retryCount <= maxRetries && isMountedRef.current) {
+        if (isPaused) {
+          // If paused, abort this specific chunk request (if it's still in the map)
+          activeChunkAbortControllersRef.current.get(chunkIndex)?.abort('Upload paused by user');
+          activeChunkAbortControllersRef.current.delete(chunkIndex); // Clean up
+          throw new Error('Upload paused');
+        }
+
+        try {
+          const response = await axios.post<ChunkUploadResponse>(endpoint, chunkFormData, {
+            onUploadProgress: (progressEvent) => {
+              if (progressEvent.total && isMountedRef.current) {
+                const chunkPercent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+                // Calculate current file's progress based on completed chunks + current chunk's progress
+                const currentFileProgressCalculated = (
+                    (filesProgress[fileName]?.uploadedChunks?.length || 0) * chunkSize + progressEvent.loaded
+                  ) / (totalChunks * chunkSize) * 100;
+
+                updateProgress(
+                  fileName,
+                  Math.min(100, Math.round(currentFileProgressCalculated)), // Cap at 100
+                  'uploading',
+                  `Chunk ${chunkIndex + 1}/${totalChunks} (${chunkPercent}%)`,
+                  fileId,
+                  totalChunks,
+                  // Do not add chunkIndex to uploadedChunks here, only on successful completion
+                  filesProgress[fileName]?.uploadedChunks
+                );
+              }
+            },
+            signal: controller.signal,
+            timeout: 30 * 60 * 1000,
+            maxBodyLength: Infinity,
+            maxContentLength: Infinity,
+          });
+
+          // Chunk successfully uploaded, remove its controller from the map
+          activeChunkAbortControllersRef.current.delete(chunkIndex);
+
+          // Update the file's uploadedChunks list
+          setFilesProgress(prev => {
+            const currentFileEntry = prev[fileName];
+            const updatedUploadedChunks = currentFileEntry?.uploadedChunks
+              ? [...currentFileEntry.uploadedChunks, chunkIndex]
+              : [chunkIndex];
+            const uniqueUploadedChunks = Array.from(new Set(updatedUploadedChunks)).sort((a, b) => a - b);
+            const newProgress = Math.round((uniqueUploadedChunks.length / totalChunks) * 100);
+
+            return {
+              ...prev,
+              [fileName]: {
+                ...currentFileEntry,
+                uploadedChunks: uniqueUploadedChunks,
+                progress: newProgress,
+                message: `Chunk ${chunkIndex + 1} completed.`
+              }
+            };
+          });
+
+          return response.data;
+        } catch (error) {
+          if (axios.isCancel(error)) {
+            // Request was intentionally cancelled (e.g., by pause or unmount)
+            throw error; // Re-throw to exit the loop/function gracefully
+          }
+
+          if (retryCount === maxRetries) {
+            console.error(`Max retries exceeded for chunk ${chunkIndex}.`, error);
+            throw error;
+          }
+
+          retryCount++;
+          const delay = Math.pow(2, retryCount) * 1000;
+          console.warn(`Chunk ${chunkIndex} upload failed, retrying in ${delay / 1000}ms (attempt ${retryCount}/${maxRetries})...`, error);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+      throw new Error('Upload process interrupted or max retries exceeded for chunk.');
+    },
+    [isPaused, isMountedRef, updateProgress, chunkSize, chunkStorageMethod, filesProgress] // Added filesProgress as a dependency
+  );
+
+
+  // --- Effects ---
 
   // Load previous uploads on component mount
   useEffect(() => {
@@ -55,16 +230,26 @@ const ChunkedUploader: React.FC = () => {
       try {
         const parsed = JSON.parse(savedUploads);
         setFilesProgress(parsed);
-        
-        // Find any paused uploads
+
+        // Find any paused uploads to set initial state for selected file
         const pausedUpload = Object.values(parsed).find(
           (file: any) => file.status === 'paused'
         ) as FileProgress | undefined;
-        
+
         if (pausedUpload) {
-          setChunkUploadId(pausedUpload.fileId || '');
+          // If a paused upload exists, pre-select it
+          const dummyFile = new File([], pausedUpload.name, {
+            type: 'application/octet-stream',
+            lastModified: Date.now()
+          });
+          Object.defineProperty(dummyFile, 'size', { value: pausedUpload.fileSize || 0 });
+          setChunkedFile(dummyFile);
+
+          setCurrentFileId(pausedUpload.fileId || '');
           setChunkSize(pausedUpload.chunkSize || 5 * 1024 * 1024);
           setChunkStorageMethod(pausedUpload.storageMethod || 'disk');
+          setIsPaused(true);
+          setCurrentFileStatusMessage(`Found paused upload for '${pausedUpload.name}'. Click Resume to continue.`);
         }
       } catch (error) {
         console.error('Failed to parse saved uploads', error);
@@ -73,171 +258,73 @@ const ChunkedUploader: React.FC = () => {
 
     return () => {
       isMountedRef.current = false;
-      activeUploadsRef.current.forEach(controller => controller.abort());
+      // Abort any remaining active requests on unmount
+      activeChunkAbortControllersRef.current.forEach(controller => controller.abort('Component unmounted'));
+      activeChunkAbortControllersRef.current.clear();
     };
   }, []);
 
-  // Save upload progress to localStorage
+  // Save upload progress to localStorage whenever filesProgress changes
   useEffect(() => {
     localStorage.setItem('chunkedUploads', JSON.stringify(filesProgress));
   }, [filesProgress]);
 
-  const updateProgress = (
-    fileName: string,
-    progress: number,
-    status: FileProgress['status'],
-    message?: string,
-    fileId?: string,
-    totalChunks?: number,
-    uploadedChunks?: number[]
-  ) => {
-    setFilesProgress(prev => ({
-      ...prev,
-      [fileName]: {
-        name: fileName,
-        progress,
-        status,
-        message,
-        fileId,
-        totalChunks,
-        uploadedChunks: uploadedChunks || prev[fileName]?.uploadedChunks || [],
-        fileSize: chunkedFile?.size,
-        chunkSize,
-        storageMethod: chunkStorageMethod
-      }
-    }));
-  };
+  // --- Handlers ---
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
       setChunkedFile(file);
-      
-      // Check if this file has existing progress
+
+      // Check if this file has existing progress in state
       const existingProgress = filesProgress[file.name];
-      if (existingProgress && existingProgress.status === 'paused') {
-        setChunkUploadId(existingProgress.fileId || '');
+      if (existingProgress && existingProgress.status === 'paused' && existingProgress.fileId) {
+        setCurrentFileId(existingProgress.fileId);
         setChunkSize(existingProgress.chunkSize || 5 * 1024 * 1024);
         setChunkStorageMethod(existingProgress.storageMethod || 'disk');
+        setIsPaused(true);
+        setIsUploading(false);
+        setCurrentFileStatusMessage(`Selected previously paused file '${file.name}'. Click Resume to continue.`);
       } else {
-        setChunkUploadId(''); // Reset for new file
+        setCurrentFileId(''); // Reset for a new file or non-resumable state
+        setIsPaused(false);
+        setIsUploading(false);
+        setCurrentFileStatusMessage(null);
+        // Also ensure the input is clear if a new file is selected, effectively resetting for that file
+        // This is important if you choose a file, cancel, then pick it again.
+        updateProgress(file.name, 0, 'pending', 'Ready to upload.', '', 0, []);
       }
     }
   };
 
-  const uploadChunkWithRetry = async (
-    chunk: Blob,
-    chunkIndex: number,
-    totalChunks: number,
-    fileName: string,
-    fileId: string,
-    endpoint: string,
-    maxRetries: number = 3
-  ): Promise<ChunkUploadResponse> => {
-    let retryCount = 0;
-    const chunkFormData = new FormData();
-    chunkFormData.append('chunk', chunk, `${fileName}.part${chunkIndex}`);
-    chunkFormData.append('chunkIndex', chunkIndex.toString());
-    chunkFormData.append('totalChunks', totalChunks.toString());
-    chunkFormData.append('fileName', fileName);
-    chunkFormData.append('fileId', fileId);
-    chunkFormData.append('storageMethod', chunkStorageMethod);
-
-    const controller = new AbortController();
-    activeUploadsRef.current.push(controller);
-
-    while (retryCount <= maxRetries && isMountedRef.current) {
-      if (isPaused) {
-        controller.abort();
-        throw new Error('Upload paused');
-      }
-
-      try {
-        const response = await axios.post<ChunkUploadResponse>(endpoint, chunkFormData, {
-          onUploadProgress: (progressEvent) => {
-            if (progressEvent.total && isMountedRef.current) {
-              const chunkPercent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-              const overallProgress = Math.round(
-                ((chunkIndex * chunkSize + progressEvent.loaded) / (totalChunks * chunkSize)) * 100
-              );
-              setChunkProgress(overallProgress);
-              updateProgress(
-                fileName,
-                overallProgress,
-                'uploading',
-                `Chunk ${chunkIndex + 1}/${totalChunks} (${chunkPercent}%)`,
-                fileId,
-                totalChunks,
-                [...(filesProgress[fileName]?.uploadedChunks || []), chunkIndex]
-              );
-            }
-          },
-          signal: controller.signal,
-          timeout: 30 * 60 * 1000,
-          maxBodyLength: Infinity,
-          maxContentLength: Infinity,
-        });
-
-        activeUploadsRef.current = activeUploadsRef.current.filter(c => c !== controller);
-        return response.data;
-      } catch (error) {
-        if (axios.isCancel(error)) {
-          throw error;
-        }
-        if (retryCount === maxRetries) {
-          throw error;
-        }
-        retryCount++;
-        const delay = Math.pow(2, retryCount) * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-    throw new Error('Max retries exceeded');
-  };
-
-  const checkExistingUpload = async (fileName: string): Promise<string | null> => {
-    const existingProgress = filesProgress[fileName];
-    if (existingProgress?.fileId) {
-      try {
-        const response = await axios.get<UploadStatusResponse>(
-          `${API_BASE_URL}/status/${existingProgress.fileId}`
-        );
-        
-        if (response.data.exists) {
-          // Verify the file matches
-          if (response.data.fileSize === existingProgress.fileSize && 
-              response.data.fileName === fileName) {
-            return existingProgress.fileId;
-          }
-        }
-      } catch (error) {
-        console.error('Failed to check upload status', error);
-      }
-    }
-    return null;
-  };
-
-  const handleChunkedUpload = async () => {
+  const handleChunkedUpload = useCallback(async () => {
     if (!chunkedFile) return;
 
     setIsUploading(true);
-    setIsPaused(false);
-    setChunkProgress(0);
+    setIsPaused(false); // Ensure isPaused is false when starting/resuming
 
     const totalChunks = Math.ceil(chunkedFile.size / chunkSize);
-    const chunkUploadEndpoint = chunkStorageMethod === 'disk' 
-      ? `${API_BASE_URL}/upload` 
+    const chunkUploadEndpoint = chunkStorageMethod === 'disk'
+      ? `${API_BASE_URL}/upload`
       : `${API_BASE_URL}/upload-memory`;
 
+    let fileId = currentFileId; // Start with existing ID if available
+
     try {
-      // Check for existing upload
-      let fileId = chunkUploadId;
+      // 1. Determine if resuming or starting new
       if (!fileId) {
-        fileId = await checkExistingUpload(chunkedFile.name) as string;
+        // Check if backend has a record of this file (e.g., from an aborted session not in localStorage)
+        const existingProgressOnBackend = await checkUploadStatus(filesProgress[chunkedFile.name]?.fileId || '');
+        if (existingProgressOnBackend.exists &&
+            existingProgressOnBackend.fileName === chunkedFile.name &&
+            existingProgressOnBackend.fileSize === chunkedFile.size) {
+            fileId = existingProgressOnBackend.fileId!;
+            console.log(`Backend found existing session for '${chunkedFile.name}' with ID: ${fileId}`);
+        }
       }
 
       if (!fileId) {
-        // Start new upload session
+        // Start a brand new upload session
         const startResponse = await axios.post<ChunkUploadResponse>(`${API_BASE_URL}/start`, {
           fileName: chunkedFile.name,
           fileSize: chunkedFile.size,
@@ -245,84 +332,121 @@ const ChunkedUploader: React.FC = () => {
           storageMethod: chunkStorageMethod
         });
         fileId = startResponse.data.fileId;
+        console.log(`Started new upload session with fileId: ${fileId}`);
       }
 
-      setChunkUploadId(fileId);
+      setCurrentFileId(fileId); // Update currentFileId state
       updateProgress(
         chunkedFile.name,
         0,
         'uploading',
-        'Starting upload...',
+        'Preparing upload...',
         fileId,
-        totalChunks
+        totalChunks,
+        [] // Start with empty uploadedChunks for initial update
       );
 
-      // Get list of chunks to upload (skip already uploaded ones)
-      const existingProgress = filesProgress[chunkedFile.name];
-      const uploadedChunks = existingProgress?.uploadedChunks || [];
+      // 2. Get server status for already uploaded chunks
+      const serverStatus = await checkUploadStatus(fileId);
+      let uploadedChunksFromServer = serverStatus.uploadedChunks || [];
+      if (serverStatus.exists && serverStatus.totalChunks !== totalChunks) {
+          // Mismatch in totalChunks, potentially an old or corrupt session. Decide how to handle.
+          // For now, let's assume it's an error and restart or notify.
+          throw new Error('Total chunks mismatch with server. Starting new session or error.');
+      }
+
+      // Merge client-side known uploaded chunks (from localStorage) with server-side known chunks
+      const clientKnownUploadedChunks = filesProgress[chunkedFile.name]?.uploadedChunks || [];
+      const combinedUploadedChunks = Array.from(new Set([...uploadedChunksFromServer, ...clientKnownUploadedChunks])).sort((a,b) => a-b);
+
+
+      // Update progress based on combined uploaded chunks
+      const initialProgress = (combinedUploadedChunks.length / totalChunks) * 100;
+      updateProgress(
+        chunkedFile.name,
+        initialProgress,
+        'uploading',
+        `Resuming from ${initialProgress.toFixed(0)}% (${combinedUploadedChunks.length}/${totalChunks} chunks)...`,
+        fileId,
+        totalChunks,
+        combinedUploadedChunks
+      );
+
+      // 3. Prepare chunks to upload
       const chunksToUpload = Array.from({ length: totalChunks }, (_, i) => i)
-        .filter(i => !uploadedChunks.includes(i));
+        .filter(i => !combinedUploadedChunks.includes(i));
 
-      // Upload chunks with concurrency control
-      const concurrencyLimit = navigator.hardwareConcurrency || 3;
+      console.log(`Chunks remaining to upload: ${chunksToUpload.length}`);
+
+      // 4. Implement Concurrency Control
+      const concurrencyLimit = 3; // Number of concurrent chunk uploads
       const uploadQueue = [...chunksToUpload];
-      const activeUploads: Promise<void>[] = [];
+      const activeUploadPromises: Promise<ChunkUploadResponse>[] = [];
 
-      const processQueue = async () => {
-        while ((uploadQueue.length > 0 || activeUploads.length > 0) && !isPaused && isMountedRef.current) {
-          // Start new uploads while under concurrency limit
-          while (uploadQueue.length > 0 && activeUploads.length < concurrencyLimit && !isPaused && isMountedRef.current) {
-            const chunkIndex = uploadQueue.shift();
-            if (chunkIndex === undefined) continue;
-
-            const start = chunkIndex * chunkSize;
-            const end = Math.min(start + chunkSize, chunkedFile.size);
-            const chunk = chunkedFile.slice(start, end);
-
-            const uploadPromise = uploadChunkWithRetry(
-              chunk,
-              chunkIndex,
-              totalChunks,
-              chunkedFile.name,
-              fileId,
-              chunkUploadEndpoint
-            ).then(response => {
-              console.log(`Chunk ${chunkIndex} uploaded:`, response.message);
-            }).catch(error => {
-              if (error.message !== 'Upload paused') {
-                console.error(`Failed to upload chunk ${chunkIndex}:`, error);
-                throw error;
-              }
-            }).finally(() => {
-              activeUploads.splice(activeUploads.indexOf(uploadPromise), 1);
-            });
-
-            activeUploads.push(uploadPromise);
-          }
-
-          // Wait for at least one upload to complete
-          if (activeUploads.length > 0) {
-            await Promise.race(activeUploads);
-          }
+      const processNextChunk = async () => {
+        if (!isMountedRef.current || isPaused) {
+          // Stop processing if component unmounted or paused
+          return;
         }
 
-        if (isPaused && isMountedRef.current) {
-          updateProgress(
+        if (uploadQueue.length === 0 && activeUploadPromises.length === 0) {
+          // All chunks are either processed or in flight, and no more in queue
+          return;
+        }
+
+        while (uploadQueue.length > 0 && activeUploadPromises.length < concurrencyLimit && !isPaused && isMountedRef.current) {
+          const chunkIndex = uploadQueue.shift() as number; // Safe because we check length
+          const start = chunkIndex * chunkSize;
+          const end = Math.min(start + chunkSize, chunkedFile.size);
+          const chunk = chunkedFile.slice(start, end);
+
+          const uploadPromise = uploadChunkWithRetry(
+            chunk,
+            chunkIndex,
+            totalChunks,
             chunkedFile.name,
-            chunkProgress,
-            'paused',
-            'Upload paused - you can resume later',
             fileId,
-            totalChunks
-          );
-          throw new Error('Upload paused');
+            chunkUploadEndpoint
+          ).catch(error => {
+            if (axios.isCancel(error) || error.message === 'Upload paused') {
+              console.log(`Chunk ${chunkIndex} upload cancelled/paused.`);
+              // Do not re-add to queue, just don't re-throw to stop higher-level flow
+            } else {
+              console.error(`Unhandled error for chunk ${chunkIndex}:`, error);
+              updateProgress(chunkedFile.name, filesProgress[chunkedFile.name]?.progress || 0, 'error', `Chunk ${chunkIndex} failed.`, fileId);
+              // You might want to re-add to queue or handle critical error
+            }
+            return null; // Return null on error to indicate it didn't complete successfully
+          });
+          activeUploadPromises.push(uploadPromise as Promise<ChunkUploadResponse>); // Add to active promises
+        }
+
+        // Wait for any of the active uploads to complete, then try to process next
+        if (activeUploadPromises.length > 0) {
+            await Promise.race(activeUploadPromises.map(p => p.catch(() => null))); // Race but ignore rejections
+            // Filter out completed/failed promises and then recursively call to process more
+            const completedOrFailed = await Promise.all(activeUploadPromises.map(p => Promise.resolve(p).then(res => ({res, p})).catch(err => ({err, p}))));
+            activeUploadPromises.splice(0, activeUploadPromises.length, ...completedOrFailed.filter(item => {
+                if (item.res) return false; // Completed
+                if (axios.isCancel(item.err) || item.err.message === 'Upload paused') return false; // Cancelled/paused
+                return true; // Still active or truly failed
+            }).map(item => item.p));
+
+            // Small delay to prevent tight loop if all promises fail quickly
+            await new Promise(resolve => setTimeout(resolve, 50));
+
+            // Continue processing the queue
+            await processNextChunk();
         }
       };
 
-      await processQueue();
+      await processNextChunk(); // Start the concurrent upload process
 
-      // Finalize upload if not paused
-      if (!isPaused && isMountedRef.current) {
+
+      // 5. Finalize upload if not paused and all chunks are uploaded
+      // Re-check server status to be sure
+      const finalServerStatus = await checkUploadStatus(fileId);
+      if (!isPaused && isMountedRef.current && finalServerStatus.uploadedChunks?.length === totalChunks) {
         const finalizeResponse = await axios.post<ChunkUploadResponse>(`${API_BASE_URL}/complete`, {
           fileId,
           fileName: chunkedFile.name,
@@ -337,120 +461,191 @@ const ChunkedUploader: React.FC = () => {
             'completed',
             'Upload complete',
             fileId,
-            totalChunks
+            totalChunks,
+            Array.from({ length: totalChunks }, (_, i) => i) // Mark all as uploaded
           );
-          setChunkStatus('Upload completed successfully');
+          setCurrentFileStatusMessage('Upload completed successfully!');
+          // Clear selected file after successful upload
           resetUploadState();
         } else {
-          throw new Error('Upload incomplete after finalization');
+          throw new Error('Upload incomplete after finalization. Missing final path.');
         }
+      } else if (isPaused) {
+        setCurrentFileStatusMessage('Upload paused. Ready to resume.');
+      } else if (!isMountedRef.current) {
+        setCurrentFileStatusMessage('Upload interrupted due to component unmount.');
+      } else {
+         // This else block catches cases where the loop finished but not all chunks were uploaded
+         // (e.g., due to an error, or a chunk was skipped without proper handling)
+         console.warn("Upload loop completed, but not all chunks were reported as uploaded. Final status:", finalServerStatus);
+         setCurrentFileStatusMessage('Upload process ended, but not all chunks completed. Check network/server or retry.');
+         updateProgress(
+           chunkedFile.name,
+           finalServerStatus.uploadedChunks?.length ? (finalServerStatus.uploadedChunks.length / totalChunks) * 100 : 0,
+           'error',
+           'Upload incomplete or interrupted.',
+           fileId
+         );
       }
     } catch (error: any) {
       if (isMountedRef.current) {
-        if (error.message !== 'Upload paused') {
-          console.error('Chunked upload failed:', error);
+        if (axios.isCancel(error) || error.message === 'Upload paused' || error.message.includes('Component unmounted')) {
+          console.log('Upload process intentionally stopped/cancelled/paused.');
+          setCurrentFileStatusMessage('Upload paused by user.');
+          // Ensure file status is 'paused' in state if it was a pause action
+          if (isPaused) {
+              updateProgress(
+                  chunkedFile.name,
+                  filesProgress[chunkedFile.name]?.progress || 0,
+                  'paused',
+                  'Upload paused.',
+                  currentFileId
+              );
+          }
+        } else {
+          console.error('Chunked upload critical error:', error);
           const errorMessage = error.response?.data?.message || error.message || 'Unknown error';
           updateProgress(
             chunkedFile.name,
-            chunkProgress,
+            filesProgress[chunkedFile.name]?.progress || 0,
             'error',
             `Upload failed: ${errorMessage}`,
-            chunkUploadId
+            currentFileId
           );
-          setChunkStatus(`Upload failed: ${errorMessage}`);
+          setCurrentFileStatusMessage(`Upload failed: ${errorMessage}`);
         }
-        setIsUploading(false);
+        setIsUploading(false); // Stop uploading state
       }
     }
-  };
+  }, [
+    chunkedFile,
+    chunkSize,
+    chunkStorageMethod,
+    currentFileId,
+    isPaused, // Depend on isPaused to react to changes
+    isMountedRef,
+    updateProgress,
+    checkUploadStatus,
+    filesProgress, // Depend on filesProgress for correct initial uploaded chunks
+    uploadChunkWithRetry // Depend on memoized function
+  ]);
 
-  const pauseUpload = () => {
+
+  const pauseUpload = useCallback(() => {
     setIsPaused(true);
-    // Abort all active requests
-    activeUploadsRef.current.forEach(controller => {
+    setIsUploading(false); // Visually stop uploading
+
+    // Abort all active requests immediately
+    activeChunkAbortControllersRef.current.forEach(controller => {
       controller.abort('Upload paused by user');
     });
-    activeUploadsRef.current = [];
-  };
+    activeChunkAbortControllersRef.current.clear(); // Clear the map
 
-  const resumeUpload = async () => {
-    if (!chunkedFile) return;
-    
-    try {
-      // Verify the upload can be resumed
-      const response = await axios.get<UploadStatusResponse>(
-        `${API_BASE_URL}/status/${chunkUploadId}`
+    if (chunkedFile) {
+      updateProgress(
+        chunkedFile.name,
+        filesProgress[chunkedFile.name]?.progress || 0,
+        'paused',
+        'Upload paused - you can resume later',
+        currentFileId
       );
-      
-      if (!response.data.exists) {
-        throw new Error('Upload session expired or not found');
+      setCurrentFileStatusMessage('Upload paused.');
+    }
+  }, [chunkedFile, currentFileId, filesProgress, updateProgress]);
+
+  const resumeUpload = useCallback(async () => {
+    if (!chunkedFile || !currentFileId) {
+      setCurrentFileStatusMessage("No file or upload ID available to resume.");
+      return;
+    }
+
+    try {
+      console.log(`Attempting to resume upload for file ID: ${currentFileId}`);
+
+      const status = await checkUploadStatus(currentFileId);
+      console.log("Upload status response for resume:", status);
+
+      if (!status.exists) {
+        throw new Error('Upload session expired or not found on server.');
       }
 
-      // User must re-select the same file
-      if (response.data.fileName !== chunkedFile.name || 
-          response.data.fileSize !== chunkedFile.size) {
-        throw new Error('Please select the same file to resume upload');
+      // Crucial: Verify the file matches the one being resumed
+      if (status.fileName !== chunkedFile.name || status.fileSize !== chunkedFile.size) {
+        console.error("File mismatch detected. Cannot resume upload.");
+        setCurrentFileStatusMessage("File has changed! Please select the original file to resume.");
+        throw new Error('File has changed - please select the original file');
       }
 
-      setIsPaused(false);
-      setIsUploading(true);
+      setIsPaused(false); // Unpause
+      setIsUploading(true); // Start uploading visuals
+      setCurrentFileStatusMessage('Resuming upload...');
+      console.log("Resuming upload...");
+
+      // Call handleChunkedUpload, which will pick up from the existing status
       await handleChunkedUpload();
     } catch (error) {
       console.error('Resume failed:', error);
       if (chunkedFile) {
         updateProgress(
           chunkedFile.name,
-          chunkProgress,
+          filesProgress[chunkedFile.name]?.progress || 0,
           'error',
-          'Resume failed - please select the same file and try again',
-          chunkUploadId
+          'Resume failed - ' + (error as Error).message,
+          currentFileId
         );
       }
+      setCurrentFileStatusMessage('Resume failed: ' + (error as Error).message);
       setIsUploading(false);
     }
-  };
+  }, [chunkedFile, currentFileId, checkUploadStatus, handleChunkedUpload, filesProgress, updateProgress]);
 
-  const cancelUpload = () => {
+  const cancelUpload = useCallback(() => {
     setIsUploading(false);
     setIsPaused(false);
-    // Abort all active requests
-    activeUploadsRef.current.forEach(controller => {
+    setCurrentFileStatusMessage('Upload cancelled.');
+
+    // Abort all active requests immediately
+    activeChunkAbortControllersRef.current.forEach(controller => {
       controller.abort('Upload cancelled by user');
     });
-    activeUploadsRef.current = [];
-    
+    activeChunkAbortControllersRef.current.clear(); // Clear the map
+
     if (chunkedFile) {
       updateProgress(
         chunkedFile.name,
-        0,
-        'error',
+        0, // Reset progress
+        'error', // Indicate cancelled status
         'Upload cancelled',
-        chunkUploadId
+        currentFileId
       );
     }
+    // Clean up current selection
     resetUploadState();
-  };
+  }, [chunkedFile, currentFileId, updateProgress]);
 
-  const resetUploadState = () => {
+  const resetUploadState = useCallback(() => {
     setChunkedFile(null);
-    setChunkUploadId('');
+    setCurrentFileId('');
     if (fileInputRef.current) {
-      fileInputRef.current.value = '';
+      fileInputRef.current.value = ''; // Clear file input field
     }
-  };
+  }, []);
+
+  // --- Render Logic ---
 
   return (
     <div className="chunked-uploader">
       <h2>Chunked File Upload with Pause/Resume</h2>
-      
+
       <div className="upload-controls">
         <input
           type="file"
           ref={fileInputRef}
           onChange={handleFileChange}
-          disabled={isUploading && !isPaused}
+          // Disable file input only when an upload is truly active (not just paused)
+          disabled={isUploading}
         />
-        
+
         <div className="settings">
           <label>
             Chunk Size (MB):
@@ -459,24 +654,25 @@ const ChunkedUploader: React.FC = () => {
               value={chunkSize / (1024 * 1024)}
               onChange={(e) => setChunkSize(Number(e.target.value) * 1024 * 1024)}
               min="1"
-              disabled={isUploading && !isPaused}
+              disabled={isUploading}
             />
           </label>
-          
+
           <label>
             Storage Method:
             <select
               value={chunkStorageMethod}
               onChange={(e) => setChunkStorageMethod(e.target.value as 'disk' | 'memory')}
-              disabled={isUploading && !isPaused}
+              disabled={isUploading}
             >
               <option value="disk">Disk Storage</option>
               <option value="memory">Memory Storage</option>
             </select>
           </label>
         </div>
-        
-        {!isUploading ? (
+
+        {/* Action Buttons */}
+        {!isUploading && !isPaused ? (
           <button
             onClick={handleChunkedUpload}
             disabled={!chunkedFile}
@@ -485,24 +681,24 @@ const ChunkedUploader: React.FC = () => {
             Start Upload
           </button>
         ) : isPaused ? (
-          <button 
+          <button
             onClick={resumeUpload}
             className="resume-button"
-            disabled={!chunkedFile}
+            disabled={!chunkedFile || !currentFileId} // Can only resume if a file and its ID are selected
           >
             Resume Upload
           </button>
         ) : (
-          <button 
+          <button
             onClick={pauseUpload}
             className="pause-button"
           >
             Pause Upload
           </button>
         )}
-        
-        {(isUploading || isPaused) && (
-          <button 
+
+        {(isUploading || isPaused) && ( // Show Cancel button if uploading or paused
+          <button
             onClick={cancelUpload}
             className="cancel-button"
           >
@@ -510,45 +706,70 @@ const ChunkedUploader: React.FC = () => {
           </button>
         )}
       </div>
-      
+
       {chunkedFile && (
         <div className="upload-info">
-          <h3>File: {chunkedFile.name}</h3>
+          <h3>Currently Selected File: {chunkedFile.name}</h3>
           <p>Size: {(chunkedFile.size / (1024 * 1024)).toFixed(2)} MB</p>
-          <p>Chunks: {Math.ceil(chunkedFile.size / chunkSize)}</p>
+          <p>Estimated Chunks: {Math.ceil(chunkedFile.size / chunkSize)}</p>
           <p>Storage Method: {chunkStorageMethod}</p>
-          {filesProgress[chunkedFile.name]?.fileId && (
-            <p>Upload ID: {filesProgress[chunkedFile.name].fileId}</p>
+          {currentFileId && (
+            <p>Current Upload ID: {currentFileId}</p>
           )}
         </div>
       )}
-      
+
+      {/* --- Overall Site Progress --- */}
+      <div className="overall-progress">
+        <h3>Overall Site Progress (All Uploads)</h3>
+        <div className="progress-bar">
+          <div
+            className="progress-fill"
+            style={{ width: `${overallSiteProgress}%` }}
+          />
+          <span className="progress-percent">{overallSiteProgress.toFixed(0)}%</span>
+        </div>
+      </div>
+
+      {/* --- Individual File Progress List --- */}
       <div className="progress-container">
+        <h3>Individual File Progress</h3>
         {Object.values(filesProgress)
-          .sort((a, b) => a.status === 'uploading' ? -1 : 1)
+          .sort((a, b) => {
+            // Sort to show uploading/paused files first
+            const statusOrder = { 'uploading': 1, 'paused': 2, 'pending': 3, 'error': 4, 'completed': 5 };
+            return (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99);
+          })
           .map((fileProgress) => (
             <div key={fileProgress.name} className={`progress-item ${fileProgress.status}`}>
               <div className="file-info">
                 <span className="file-name">{fileProgress.name}</span>
-                <span className="file-status">{fileProgress.message || fileProgress.status}</span>
-                {fileProgress.status === 'paused' && (
-                  <button 
+                <span className="file-status">({fileProgress.status}): {fileProgress.message}</span>
+                {/* Button to select a paused file from the list to make it the "current" file for resume */}
+                {fileProgress.status === 'paused' && fileProgress.fileId && fileProgress.name !== chunkedFile?.name && (
+                  <button
                     onClick={() => {
-                      // Create a dummy file object with same metadata
-                      const file = new File([], fileProgress.name || '', {
+                      const dummyFile = new File([], fileProgress.name || '', {
                         type: 'application/octet-stream',
                         lastModified: Date.now()
                       });
-                      Object.defineProperty(file, 'size', { value: fileProgress.fileSize || 0 });
-                      
-                      setChunkedFile(file);
-                      setChunkUploadId(fileProgress.fileId || '');
+                      Object.defineProperty(dummyFile, 'size', { value: fileProgress.fileSize || 0 });
+
+                      setChunkedFile(dummyFile);
+                      setCurrentFileId(fileProgress.fileId || '');
                       setChunkSize(fileProgress.chunkSize || 5 * 1024 * 1024);
                       setChunkStorageMethod(fileProgress.storageMethod || 'disk');
+                      setIsPaused(true);
+                      setIsUploading(false);
+                      setCurrentFileStatusMessage(`Selected '${fileProgress.name}' for resume. Click Resume Upload.`);
+                      // Visually update the file input too
+                      if (fileInputRef.current) {
+                        fileInputRef.current.value = ''; // Cannot programmatically set file, but clear for clarity
+                      }
                     }}
                     className="resume-file-button"
                   >
-                    Select File to Resume
+                    Select to Resume
                   </button>
                 )}
               </div>
@@ -557,23 +778,25 @@ const ChunkedUploader: React.FC = () => {
                   className="progress-fill"
                   style={{ width: `${fileProgress.progress}%` }}
                 />
-                <span className="progress-percent">{fileProgress.progress}%</span>
+                <span className="progress-percent">{fileProgress.progress.toFixed(0)}%</span>
               </div>
             </div>
           ))}
       </div>
-      
-      {chunkStatus && <div className="status-message">{chunkStatus}</div>}
+
+      {currentFileStatusMessage && <div className="status-message">{currentFileStatusMessage}</div>}
 
       <div className="upload-instructions">
         <h3>How to resume uploads:</h3>
         <ol>
-          <li>Pause an ongoing upload</li>
-          <li>Refresh the page</li>
-          <li>Click "Select File to Resume" next to your file</li>
-          <li>Click "Resume Upload"</li>
+          <li>**Pause** an ongoing upload using the "Pause Upload" button.</li>
+          <li>You can **refresh the page**; the saved progress will load automatically into the list.</li>
+          <li>To resume a specific file, ensure it's displayed as "Currently Selected File". If not, click "Select to Resume" next to your desired file in the "Individual File Progress" list.</li>
+          <li>Click the **"Resume Upload"** button.</li>
         </ol>
-        <p><strong>Note:</strong> You must select the exact same file to resume the upload.</p>
+        <p>
+          **Important:** For a successful resume, you should preferably use the **exact same file** you started uploading originally. The system verifies file name and size.
+        </p>
       </div>
     </div>
   );
