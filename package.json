@@ -1,8 +1,0 @@
-{
-  "dependencies": {
-    "path": "^0.12.7"
-  },
-  "devDependencies": {
-    "@types/node": "^24.0.3"
-  }
-}

@@ -2,6 +2,7 @@
 
 import GlobalErrorHandlerContextProvider from "@/context/globalErrorHandlerContext/globalErrorHandlerContextProvider";
 import RootLayout from "@/Layout/ExampleLayout";
+import ChunkedUploader from "@/pages/ChunkedUpload";
 import ErrorPage from "@/pages/Error";
 import FileUploadApp from "@/pages/FileUpload";
 import FixedChunkedUpload from "@/pages/FileUploadChunked";
@@ -15,6 +16,7 @@ enum Path {
   PRODUCTS = "/products",
   CHUNKED = "/file-upload/chunked",
   MIXED_UPLOAD = "/mixed-upload",
+  ChunkedV2 = "/file-upload/chunked-v2",
 }
 
 export const publicRoutes: RouteObject[] = [
@@ -37,6 +39,10 @@ export const publicRoutes: RouteObject[] = [
       {
         path: Path.CHUNKED,
         element: <FixedChunkedUpload />,
+      },
+      {
+        path: Path.ChunkedV2,
+        element: <ChunkedUploader />,
       },
     ],
   },

@@ -286,7 +286,7 @@ const FileUploadApp: React.FC = () => {
         fileSize: chunkedFile.size,
         totalChunks,
         // Potentially pass the storage method to the backend if it influences session creation
-        storageMethod: chunkStorageMethod // Send this to backend
+        // storageMethod: chunkStorageMethod // Send this to backend
       });
 
       const fileId = startResponse.data.fileId;

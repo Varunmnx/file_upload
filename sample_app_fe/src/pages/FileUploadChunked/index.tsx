@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Upload, File, FileText, Image, User, Trash2, CheckCircle, AlertCircle, RotateCcw, HardDrive, MemoryStick } from 'lucide-react';
+import { Upload, Trash2, CheckCircle, AlertCircle, RotateCcw, HardDrive, MemoryStick } from 'lucide-react';
 
 // Simulated API functions (replace with your actual API calls)
 const mockApi = {
