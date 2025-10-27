@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
-import { AppService } from './app.service'; 
-import { UploadModule } from './file_upload_v2/fileupload_v2.module';
+import { AppService } from './app.service';
+import { UploadModule } from './file_upload_v3/file_upload_v3.module';
 import { MulterModule } from '@nestjs/platform-express';
 
 @Module({

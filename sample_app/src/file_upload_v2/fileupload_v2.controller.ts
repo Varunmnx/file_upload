@@ -1,4 +1,4 @@
-// src/chunk-upload/chunk-upload.controller.ts
+// src/chunk-upload/fileupload_v2.controller.ts
 import {
   Controller,
   Post,
@@ -9,6 +9,7 @@ import {
   MaxFileSizeValidator,
   Get,
   Param,
+  Query,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ChunkUploadService } from './fileupload_v2.service';
@@ -18,6 +19,7 @@ import {
   CompleteChunkUploadDto,
   ChunkUploadResponse,
   UploadStatusResponse,
+  ResumeChunkUploadDto,
 } from './dto';
 import { diskStorage } from 'multer';
 import { v4 as uuidv4 } from 'uuid';
@@ -27,22 +29,39 @@ export class ChunkUploadController {
   constructor(private readonly chunkUploadService: ChunkUploadService) {}
 
   @Get('status/:fileId')
-  getUploadStatus(@Param('fileId') fileId: string): UploadStatusResponse {
+  getUploadStatus(@Param('fileId') fileId: string): Promise<UploadStatusResponse> {
+    return this.chunkUploadService.getUploadStatus(fileId);
+  }
+
+  @Get('status')
+  getUploadStatusByQuery(@Query('fileId') fileId: string): Promise<UploadStatusResponse> {
     return this.chunkUploadService.getUploadStatus(fileId);
   }
 
   @Post('cleanup')
-  cleanupAbandonedUploads() {
+  cleanupAbandonedUploads(): { message: string } {
     this.chunkUploadService.cleanupAbandonedUploads();
     return { message: 'Cleanup completed' };
   }
 
   @Post('start')
-  startChunkUpload(@Body() startChunkUploadDto: StartChunkUploadDto): ChunkUploadResponse {
+  startChunkUpload(@Body() startChunkUploadDto: StartChunkUploadDto): Promise<ChunkUploadResponse> {
     return this.chunkUploadService.startChunkUpload(
       startChunkUploadDto.fileName,
       startChunkUploadDto.fileSize,
       startChunkUploadDto.totalChunks,
+      startChunkUploadDto.storageMethod,
+    );
+  }
+
+  @Post('resume')
+  resumeChunkUpload(@Body() resumeChunkUploadDto: ResumeChunkUploadDto): Promise<ChunkUploadResponse> {
+    return this.chunkUploadService.resumeChunkUpload(
+      resumeChunkUploadDto.fileName,
+      resumeChunkUploadDto.fileSize,
+      resumeChunkUploadDto.totalChunks,
+      resumeChunkUploadDto.fileId,
+      resumeChunkUploadDto.storageMethod,
     );
   }
 
@@ -52,24 +71,24 @@ export class ChunkUploadController {
       storage: diskStorage({
         destination: './uploads/temp',
         filename: (req, file, cb) => {
-          const uniqueSuffix = `${uuidv4() as string}-${Date.now()}`;
+          const uniqueSuffix = `${uuidv4()}-${Date.now()}`;
           cb(null, `${uniqueSuffix}-${file.originalname}`);
         },
       }),
       limits: {
-        fileSize: 1024 * 1024 * 100, // 100MB (adjust based on your chunk size)
+        fileSize: 1024 * 1024 * 100, // 100MB
       },
     }),
   )
   uploadChunk(
     @UploadedFile(
       new ParseFilePipe({
-        validators: [new MaxFileSizeValidator({ maxSize: 1024 * 1024 * 100 })], // 100MB
+        validators: [new MaxFileSizeValidator({ maxSize: 1024 * 1024 * 100 })],
       }),
     )
     chunk: Express.Multer.File,
     @Body() uploadChunkDto: UploadChunkDto,
-  ): ChunkUploadResponse {
+  ): Promise<ChunkUploadResponse> {
     return this.chunkUploadService.uploadChunk(
       uploadChunkDto.fileId,
       uploadChunkDto.chunkIndex,
@@ -85,12 +104,12 @@ export class ChunkUploadController {
   uploadChunkMemory(
     @UploadedFile(
       new ParseFilePipe({
-        validators: [new MaxFileSizeValidator({ maxSize: 1024 * 1024 * 100 })], // 100MB
+        validators: [new MaxFileSizeValidator({ maxSize: 1024 * 1024 * 100 })],
       }),
     )
     chunk: Express.Multer.File,
     @Body() uploadChunkDto: UploadChunkDto,
-  ): ChunkUploadResponse {
+  ): Promise<ChunkUploadResponse> {
     return this.chunkUploadService.uploadChunk(
       uploadChunkDto.fileId,
       uploadChunkDto.chunkIndex,
@@ -102,12 +121,12 @@ export class ChunkUploadController {
   }
 
   @Post('complete')
-  completeChunkUpload(@Body() completeChunkUploadDto: CompleteChunkUploadDto): ChunkUploadResponse {
+  completeChunkUpload(@Body() completeChunkUploadDto: CompleteChunkUploadDto): Promise<ChunkUploadResponse> {
     return this.chunkUploadService.completeChunkUpload(
       completeChunkUploadDto.fileId,
       completeChunkUploadDto.fileName,
       completeChunkUploadDto.totalChunks,
-      completeChunkUploadDto.storageMethod,
+      completeChunkUploadDto?.storageMethod,
     );
   }
 }

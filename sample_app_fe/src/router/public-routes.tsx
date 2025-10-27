@@ -6,7 +6,7 @@ import ChunkedUploader from "@/pages/ChunkedUpload";
 import ErrorPage from "@/pages/Error";
 import FileUploadApp from "@/pages/FileUpload";
 import FixedChunkedUpload from "@/pages/FileUploadChunked";
-import LandingPage from "@/pages/Landing";
+// import LandingPage from "@/pages/Landing";
 import { RouteObject, useRoutes } from "react-router-dom";
 
 enum Path {

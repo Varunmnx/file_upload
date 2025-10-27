@@ -1,36 +1,47 @@
-// src/chunk-upload/dto/chunk-upload.dto.ts
-export class StartChunkUploadDto {
+// src/chunk-upload/dto.ts
+
+export interface StartChunkUploadDto {
   fileName: string;
   fileSize: number;
   totalChunks: number;
+  storageMethod?: 'disk' | 'memory';
 }
 
-export class UploadChunkDto {
-  chunk: Express.Multer.File;
+export interface ResumeChunkUploadDto {
+  fileName: string;
+  fileSize: number;
+  totalChunks: number;
+  fileId: string;
+  storageMethod?: 'disk' | 'memory';
+}
+
+export interface UploadChunkDto {
+  fileId: string;
   chunkIndex: number;
   totalChunks: number;
   fileName: string;
-  fileId: string;
-  storageMethod: 'disk' | 'memory';
+  storageMethod?: 'disk' | 'memory';
 }
 
-export class CompleteChunkUploadDto {
+export interface CompleteChunkUploadDto {
   fileId: string;
   fileName: string;
   totalChunks: number;
-  storageMethod: 'disk' | 'memory';
+  storageMethod?: 'disk' | 'memory';
 }
 
 export interface ChunkUploadResponse {
   fileId: string;
-  message?: string;
-  finalPath?: string;
+  message: string;
   chunkIndex?: number;
+  finalPath?: string;
+  resumed?: boolean;
+  skipped?: boolean;
+  uploadedChunks?: number[];
 }
 
-// src/chunk-upload/dto/chunk-upload.dto.ts
 export interface UploadStatusResponse {
-  exists: boolean;
+  exists?: boolean;
   fileName?: string;
   fileSize?: number;
   totalChunks?: number;
