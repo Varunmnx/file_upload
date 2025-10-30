@@ -1,6 +1,7 @@
+/* eslint-disable prettier/prettier */
 // upload-pool.service.ts
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -143,16 +144,19 @@ export class UploadPoolService {
     this.uploadSessions.delete(uploadId);
   }
 
-  private cleanupChunks(uploadId: string): void {
-    const uploadChunkDir = join(this.chunksDir, uploadId);
-    if (existsSync(uploadChunkDir)) {
-      const chunks = readdirSync(uploadChunkDir);
-      chunks.forEach((chunk) => {
-        unlinkSync(join(uploadChunkDir, chunk));
-      });
-      unlinkSync(uploadChunkDir);
-    }
+private cleanupChunks(uploadId: string): void {
+  const uploadChunkDir = join(this.chunksDir, uploadId);
+  if (existsSync(uploadChunkDir)) {
+    const chunks = readdirSync(uploadChunkDir);
+    chunks.forEach((chunk) => {
+      unlinkSync(join(uploadChunkDir, chunk));
+    });
+    // Use rmSync or rmdirSync instead of unlinkSync for directories
+    rmSync(uploadChunkDir, { recursive: true, force: true });
+    // Alternative for older Node versions:
+    // rmdirSync(uploadChunkDir);
   }
+}
 
   private startCleanupInterval(): void {
     setInterval(
