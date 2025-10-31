@@ -9,13 +9,6 @@ export class InitiateUploadDto {
 
   @IsNumber()
   fileSize: number;
-
-  @IsNumber()
-  totalChunks: number;
-
-  @IsString()
-  @IsOptional()
-  fileHash?: string; // Optional: for file integrity
 }
 
 export class UploadChunkDto {

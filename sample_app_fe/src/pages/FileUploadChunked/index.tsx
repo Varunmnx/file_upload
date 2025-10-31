@@ -3,7 +3,7 @@ import { Upload, Trash2, CheckCircle, AlertCircle, RotateCcw, HardDrive, MemoryS
 
 // Simulated API functions (replace with your actual API calls)
 const mockApi = {
-  startChunkedUpload: async (data: any) => {
+  startChunkedUpload: async (p0: { fileName: string; fileSize: number; totalChunks: number; storageMethod: "disk" | "memory"; }) => {
     await new Promise(resolve => setTimeout(resolve, 500));
     return { data: { fileId: `upload_${Date.now()}`, message: 'Upload session started' } };
   },
@@ -38,7 +38,7 @@ const mockApi = {
     };
   },
   
-  checkStatus: async (data: any) => {
+  checkStatus: async (p0: { fileId: string; }) => {
     await new Promise(resolve => setTimeout(resolve, 300));
     return {
       data: {

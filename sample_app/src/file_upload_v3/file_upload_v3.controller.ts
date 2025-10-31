@@ -1,5 +1,6 @@
+/* eslint-disable prettier/prettier */
 // eslint-disable-next-line prettier/prettier
-import { 
+import {
   Post,
   Get,
   Delete,
@@ -7,26 +8,32 @@ import {
   Param,
   UploadedFile,
   UseInterceptors,
-  BadRequestException,
+  BadRequestException
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { UploadPoolService } from './v3.service';
 import { InitiateUploadDto, UploadChunkDto, CompleteUploadDto } from './upload.dto';
-import { Controller } from '@nestjs/common';
+import { Controller } from '@nestjs/common'; 
+import { FileSizeValidationPipe } from './validation';
 
 @Controller('upload')
 export class UploadController {
-  constructor(private readonly uploadPoolService: UploadPoolService) {}
+  constructor(private readonly uploadPoolService: UploadPoolService) { }
 
   @Post('initiate')
   initiateUpload(@Body() dto: InitiateUploadDto) {
-    const uploadId = this.uploadPoolService.initiateUpload(dto.fileName, dto.fileSize, dto.totalChunks, dto.fileHash);
-    return { uploadId };
+    const chunkSize = 5 * 1024 * 1024; // 5mb
+    const totalChunks = Math.ceil(dto.fileSize / chunkSize);
+    const uploadId = this.uploadPoolService.initiateUpload(dto.fileName, dto.fileSize, totalChunks);
+    return { uploadId, totalChunks };
   }
 
   @Post('chunk')
   @UseInterceptors(FileInterceptor('chunk'))
-  async uploadChunk(@UploadedFile() file: Express.Multer.File, @Body() dto: UploadChunkDto) {
+
+  async uploadChunk(@UploadedFile(
+    new FileSizeValidationPipe(5 * 1024 * 1024)
+  ) file: Express.Multer.File, @Body() dto: UploadChunkDto) {
     if (!file) {
       throw new BadRequestException('No chunk file provided');
     }
